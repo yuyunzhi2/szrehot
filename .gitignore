@@ -1,7 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.egg-info/
 dist/
 build/
@@ -20,6 +20,10 @@ output/
 *.json
 !webbridge_sources.json
 !meta.json
+!codex_env.json
+
+# Tavily 缓存
+tavily_cache/
 
 # IDE
 .vscode/

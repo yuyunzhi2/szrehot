@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-finhot 全量数据采集入口
-依次调用 RSS 采集器 + WebBridge 采集器，合并输出统一 JSON。
+szrehot 全量数据采集入口
+依次调用 RSS 采集器 + 微信公众号采集器，合并输出统一 JSON。
 
 用法：
     python fetch_all.py --output ./data --days 1
-    python fetch_all.py --output ./data --sources regulatory,industry --with-webbridge
+    python fetch_all.py --output ./data --sources policy,market --with-weixin --with-tavily
 """
 
 import argparse
@@ -14,18 +14,23 @@ import os
 import sys
 from datetime import datetime, timezone
 
-# 同目录下的采集模块
-from rss_fetcher import fetch_rss, deduplicate, filter_by_time, filter_insurance_related, RSS_SOURCES
-from webbridge_fetcher import fetch_all as webbridge_fetch_all, load_sources_config
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
+from rss_fetcher import (fetch_rss, deduplicate, filter_by_time,
+                          filter_sz_realestate_related, RSS_SOURCES)
+from weixin_fetcher import search_weixin, WEIXIN_SEARCH_KEYWORDS, DEFAULT_KEYWORD_TEMPLATE
 
 
 def main():
-    parser = argparse.ArgumentParser(description="finhot 全量数据采集器")
+    parser = argparse.ArgumentParser(description="szrehot 全量数据采集器")
     parser.add_argument("--output", "-o", default="./data", help="输出目录")
     parser.add_argument("--days", "-d", type=int, default=1, help="采集最近 N 天数据")
     parser.add_argument("--sources", "-s", default=None, help="只采集指定分类，逗号分隔")
-    parser.add_argument("--all", action="store_true", help="不过滤保险相关，保留所有金融条目")
-    parser.add_argument("--with-webbridge", action="store_true", help="同时采集 WebBridge 源")
+    parser.add_argument("--all", action="store_true", help="不过滤深圳房产相关，保留所有条目")
+    parser.add_argument("--with-weixin", action="store_true", help="同时采集微信公众号")
+    parser.add_argument("--with-tavily", action="store_true", help="微信全文使用 Tavily 兜底")
+    parser.add_argument("--weixin-keywords", default=None, help="自定义微信搜索关键词（逗号分隔）")
     parser.add_argument("--max-entries", type=int, default=30, help="每个 RSS 源最多条目数")
     parser.add_argument("--delay", type=float, default=1.0, help="RSS 源间延迟秒数")
     args = parser.parse_args()
@@ -49,24 +54,32 @@ def main():
 
     print(f"\nRSS 原始采集: {len(rss_items)} 条")
 
-    # ========== Step 2: WebBridge 采集（可选）==========
-    webbridge_items = []
-    if args.with_webbridge:
+    # ========== Step 2: 微信公众号采集（可选）==========
+    weixin_items = []
+    if args.with_weixin:
         print("\n" + "=" * 50)
-        print("Step 2: WebBridge 采集")
+        print("Step 2: 微信公众号采集")
         print("=" * 50)
-        try:
-            webbridge_items = webbridge_fetch_all()
-            print(f"WebBridge 采集: {len(webbridge_items)} 条")
-        except Exception as e:
-            print(f"WebBridge 采集失败（可忽略）: {e}")
+
+        if args.weixin_keywords:
+            queries = [k.strip() for k in args.weixin_keywords.split(",") if k.strip()]
+        else:
+            now = datetime.now()
+            queries = [DEFAULT_KEYWORD_TEMPLATE.format(keyword=kw, year=now.year, month=now.month)
+                       for kw in WEIXIN_SEARCH_KEYWORDS]
+
+        for query in queries:
+            articles = search_weixin(query, with_tavily=args.with_tavily)
+            weixin_items.extend(articles)
+
+        print(f"\n微信采集: {len(weixin_items)} 条")
 
     # ========== Step 3: 合并 + 去重 + 过滤 ==========
     print("\n" + "=" * 50)
     print("Step 3: 合并处理")
     print("=" * 50)
 
-    all_items = rss_items + webbridge_items
+    all_items = rss_items + weixin_items
     print(f"合并: {len(all_items)} 条")
 
     all_items = deduplicate(all_items)
@@ -76,30 +89,32 @@ def main():
     print(f"时间过滤后: {len(all_items)} 条")
 
     if not args.all:
-        all_items = filter_insurance_related(all_items)
-        print(f"保险/金融相关: {len(all_items)} 条")
+        all_items = filter_sz_realestate_related(all_items)
+        print(f"深圳房产相关: {len(all_items)} 条")
 
     # 按发布时间排序
-    all_items.sort(key=lambda x: datetime.fromisoformat((x.get("publishedAt") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")), reverse=True)
+    all_items.sort(key=lambda x: datetime.fromisoformat(
+        (x.get("publishedAt") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")
+    ), reverse=True)
 
     # ========== Step 4: 保存 ==========
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(args.output, f"finhot_data_{timestamp}.json")
+    output_file = os.path.join(args.output, f"szrehot_data_{timestamp}.json")
 
     result = {
         "count": len(all_items),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "days": args.days,
         "rss_sources": len(sources),
-        "webbridge_enabled": args.with_webbridge,
+        "weixin_enabled": args.with_weixin,
+        "tavily_enabled": args.with_tavily,
         "items": all_items,
     }
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    # latest 文件
-    latest_file = os.path.join(args.output, "latest_finhot_data.json")
+    latest_file = os.path.join(args.output, "latest_szrehot_data.json")
     with open(latest_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 

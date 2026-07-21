@@ -1,0 +1,5 @@
+{
+  "tavily_api_key": "",
+  "wechatsogou_path": "",
+  "note": "Tavily API Key for WeChat article full-text fallback (optional). Leave empty to skip. WechatSogou path for script mode."
+}
