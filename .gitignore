@@ -17,6 +17,7 @@ env/
 data/
 daily/
 output/
+reports/
 *.json
 !webbridge_sources.json
 !meta.json
