@@ -2,4 +2,4 @@ interface:
   display_name: "深圳楼市日报"
   short_description: "深圳房地产每日多源聚合简报"
   brand_color: "#E63946"
-  default_prompt: "Use $szrehot to generate today's Shenzhen real estate daily report."
+  default_prompt: "生成今天的深圳楼市日报"
