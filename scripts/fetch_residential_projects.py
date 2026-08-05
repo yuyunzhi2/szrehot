@@ -17,12 +17,17 @@
 
 详见技能 SKILL.md。
 """
-import urllib.request
 import json
 import time
 import sys
 import io
 import argparse
+
+try:
+    import requests
+except ImportError:
+    print('ERROR: requests 未安装，请 pip install requests', flush=True)
+    sys.exit(3)
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -79,15 +84,15 @@ HEADERS = {
 
 
 def _request(url, body=None, retries=3):
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    method = "POST" if body is not None else "GET"
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(
-                url, data=data, headers=HEADERS,
-                method="POST" if body is not None else "GET",
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            if method == "POST":
+                r = requests.post(url, json=body, headers=HEADERS, timeout=20)
+            else:
+                r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return r.json()
         except Exception:
             if attempt == retries - 1:
                 raise

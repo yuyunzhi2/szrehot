@@ -130,8 +130,8 @@ _REPORT_TYPE_MAP = {
     '周报': 'weekly', '周度': 'weekly', '一周': 'weekly', '周刊': 'weekly',
     '月报': 'monthly', '月度': 'monthly', '月刊': 'monthly',
     '季报': 'quarterly', '季度': 'quarterly',
-    '年报': 'yearly', '年度': 'yearly',
     '半年报': 'semiannual', '半年': 'semiannual',
+    '年报': 'yearly', '年度': 'yearly',
     '数据': 'data', '成交数据': 'data', '行情': 'data',
     '情报局': 'data', '第一时间': 'daily_brief',
 }
@@ -145,6 +145,12 @@ _DATE_RANGE_RE = re.compile(
 )
 # 年月 YYYY年M月 / YYYY.MM
 _YEAR_MONTH_RE = re.compile(r'(\d{4})[\/\-.年](\d{1,2})[\/\-.月]')
+# 季度 Q1-Q4 / 第N季度
+_QUARTER_RE = re.compile(r'(?:Q|第)([1-4])(?:季度|季)?', re.IGNORECASE)
+# 半年度 H1/H2 / 上半年/下半年
+_HALF_YEAR_RE = re.compile(r'(?:H|第)([1-2])(?:半|半年)?|(上)半年|(下)半年', re.IGNORECASE)
+# 纯年份 YYYY年 或 YYYY(后跟Q/第/季等非月数字)（用于年报/季报等）
+_YEAR_ONLY_RE = re.compile(r'(\d{4})(?:年|(?=Q\d|第\d))')
 
 
 def structured_title_key(title: str) -> str | None:
@@ -187,11 +193,38 @@ def structured_title_key(title: str) -> str | None:
             year = ym_m.group(1) if ym_m else ""
             time_key = f"{year}:W{week_m.group(1)}"
 
-    # Priority 4: year-month
+    # Priority 4: quarter (Q1-Q4 / 第N季度)
+    if not time_key:
+        q_m = _QUARTER_RE.search(title)
+        if q_m:
+            year_m = _YEAR_ONLY_RE.search(title)
+            year = year_m.group(1) if year_m else ""
+            time_key = f"{year}:Q{q_m.group(1)}"
+
+    # Priority 5: half-year (H1/H2 / 上半年/下半年)
+    if not time_key:
+        h_m = _HALF_YEAR_RE.search(title)
+        if h_m:
+            year_m = _YEAR_ONLY_RE.search(title)
+            year = year_m.group(1) if year_m else ""
+            if h_m.group(1):
+                time_key = f"{year}:H{h_m.group(1)}"
+            elif h_m.group(2):  # 上半年
+                time_key = f"{year}:H1"
+            elif h_m.group(3):  # 下半年
+                time_key = f"{year}:H2"
+
+    # Priority 6: year-month
     if not time_key:
         ym_m = _YEAR_MONTH_RE.search(title)
         if ym_m:
             time_key = f"{ym_m.group(1)}-{ym_m.group(2)}"
+
+    # Priority 7: year only (for yearly reports etc.)
+    if not time_key:
+        year_m = _YEAR_ONLY_RE.search(title)
+        if year_m:
+            time_key = year_m.group(1)
 
     if not time_key:
         return None
@@ -262,8 +295,7 @@ def check_duplicate(url: str, title: str, days: int = DEFAULT_RETENTION_DAYS) ->
 
 
 def record_entry(date: str, url: str, title: str) -> None:
-    """记录一条新闻到索引"""
-    records = load_index()
+    """记录一条新闻到索引（追加模式，O(1)）"""
     companies, places, events, types = extract_entity_pairs(title)
     entry = {
         "date": date,
@@ -274,8 +306,9 @@ def record_entry(date: str, url: str, title: str) -> None:
         "structured_key": structured_title_key(title),
         "entities": {"companies": companies, "places": places, "events": events, "types": types},
     }
-    records.append(entry)
-    save_index(records)
+    INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(INDEX_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def batch_check(input_path: str, date: str, days: int = DEFAULT_RETENTION_DAYS) -> list[dict]:
@@ -334,7 +367,7 @@ def batch_check(input_path: str, date: str, days: int = DEFAULT_RETENTION_DAYS) 
 
 
 def batch_record(input_path: str, date: str) -> int:
-    """批量记录最终入选条目到索引。
+    """批量记录最终入选条目到索引（追加模式）。
 
     输入 JSON 格式: [{"title": ..., "url": ..., ...}, ...]
     返回: 记录条数
@@ -342,14 +375,29 @@ def batch_record(input_path: str, date: str) -> int:
     with open(input_path, "r", encoding="utf-8") as f:
         items = json.load(f)
 
-    count = 0
+    entries = []
     for item in items:
         title = item.get("title", "")
         url = item.get("url", "")
         if title and url:
-            record_entry(date, url, title)
-            count += 1
-    return count
+            companies, places, events, types = extract_entity_pairs(title)
+            entries.append({
+                "date": date,
+                "url": normalize_url(url),
+                "url_hash": url_hash(url),
+                "title": title,
+                "title_shingles": sorted(title_shingle_set(title)),
+                "structured_key": structured_title_key(title),
+                "entities": {"companies": companies, "places": places, "events": events, "types": types},
+            })
+
+    if entries:
+        INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(INDEX_PATH, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    return len(entries)
 
 
 def prune_index(days: int = DEFAULT_RETENTION_DAYS) -> int:
