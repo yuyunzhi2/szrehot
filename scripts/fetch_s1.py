@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S1 RSSHub 采集器 — Codex 适配版
+"""S1 RSSHub 采集器 — Claude Code 适配版
 
 拉取 14 路 RSSHub 通用财经媒体，过滤深圳相关条目，输出统一 JSON。
 
@@ -10,22 +10,9 @@
 
 镜像：首选 https://hub.slarker.me，备用 https://rsshub.liumingye.cn
 路由返回 HTML 欢迎页 = 路由不存在，跳过。串行 + 0.5s 间隔，尊重源站限流。
-已从 curl.exe 迁移到 requests（与 fetch_s15.py 一致），避免 schannel SSL 问题。
 """
-import argparse, json, re, sys, time
+import argparse, json, re, subprocess, sys, time
 sys.stdout.reconfigure(encoding='utf-8')
-
-try:
-    import requests
-except ImportError:
-    print('ERROR: requests 未安装，请 pip install requests', flush=True)
-    sys.exit(3)
-
-TIMEOUT = 15
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/150.0 Safari/537.36'
-}
 
 ROUTES = [
     ('/cls/telegraph', '财联社电报'),
@@ -59,16 +46,14 @@ def fetch_route(route, media_name, base):
     """拉取单一路由，返回 (items, status_str)。items 为统一格式列表。"""
     url = base + route
     try:
-        r = requests.get(url, timeout=TIMEOUT, headers=HEADERS)
-    except requests.exceptions.Timeout:
-        return [], f'TIMEOUT {route}'
+        r = subprocess.run(
+            ['curl.exe', '-k', '-s', '-m', '10', url],
+            capture_output=True, timeout=15,
+        )
     except Exception as e:
-        return [], f'ERR {route}: {type(e).__name__}'
+        return [], f'ERR {route}: {e}'
 
-    if r.status_code != 200:
-        return [], f'HTTP {r.status_code} {route}'
-
-    text = r.text
+    text = r.stdout.decode('utf-8', errors='replace')
     head = text[:500].lower()
     # RSSHub 路由不存在时返回 HTML 欢迎页
     if not text or '<!doctype html' in head or ('<html' in head and '<rss' not in head and '<feed' not in head):
@@ -122,7 +107,7 @@ def fetch_route(route, media_name, base):
 def run(base=None):
     """采集全部路由，base 失败则回退备用镜像。返回统一 items 列表。
 
-    回退判定：路由本身失败（SKIP/ERR/TIMEOUT/HTTP非200 = HTML欢迎页/超时/异常）才换镜像；
+    回退判定：路由本身失败（SKIP/ERR = HTML欢迎页/超时/异常）才换镜像；
     路由成功但 0 条深圳相关不算失败，不回退。
     """
     bases = [base] if base else [BASE, BASE_FALLBACK]
@@ -132,8 +117,8 @@ def run(base=None):
         for b in bases:
             items, status = fetch_route(route, media, b)
             print(status, flush=True)
-            # SKIP/ERR/TIMEOUT/HTTP = 路由失败，试下一个镜像；OK（含0条）= 路由成功，不回退
-            if not status.startswith(('SKIP', 'ERR', 'TIMEOUT', 'HTTP')):
+            # SKIP/ERR = 路由失败，试下一个镜像；OK（含0条）= 路由成功，不回退
+            if not status.startswith(('SKIP', 'ERR')):
                 all_items.extend(items)
                 got = True
                 break
@@ -163,7 +148,7 @@ def main():
         if args.json:
             print(text)
     else:
-        for i, it in enumerate(items, 1):
+        for i, it in enumerate(all_items if False else items, 1):
             print(f'{i}. [{it["source"]}] {it["title"][:80]} | {it["url"][:80]}')
 
 

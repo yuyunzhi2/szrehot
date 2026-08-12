@@ -196,8 +196,8 @@ def format_weekly(summary: dict) -> str:
         '',
         f'**周度情绪指数：{summary["index"]}（{summary["label"]}）**',
         '',
-        f'| 日期 | 指数 | 标签 | 新闻数 |',
-        f'|------|------|------|--------|',
+        '| 日期 | 指数 | 标签 | 新闻数 |',
+        '|------|------|------|--------|',
     ]
 
     # 构建日期→记录映射
@@ -221,15 +221,14 @@ def format_weekly(summary: dict) -> str:
 def format_monthly(summary: dict) -> str:
     """格式化月度汇总为 Markdown。"""
     start = datetime.strptime(summary['startDate'], '%Y-%m-%d')
-    end = datetime.strptime(summary['endDate'], '%Y-%m-%d')
 
     lines = [
         f'## {start.year}年{start.month}月市场情绪汇总',
         '',
         f'**月度情绪指数：{summary["index"]}（{summary["label"]}）**',
         '',
-        f'| 日期 | 指数 | 标签 | 新闻数 |',
-        f'|------|------|------|--------|',
+        '| 日期 | 指数 | 标签 | 新闻数 |',
+        '|------|------|------|--------|',
     ]
 
     for r in summary['dailyRecords']:

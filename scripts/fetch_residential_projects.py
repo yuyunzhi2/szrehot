@@ -17,17 +17,13 @@
 
 详见技能 SKILL.md。
 """
+import urllib.request
 import json
 import time
 import sys
 import io
+import os
 import argparse
-
-try:
-    import requests
-except ImportError:
-    print('ERROR: requests 未安装，请 pip install requests', flush=True)
-    sys.exit(3)
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -84,15 +80,15 @@ HEADERS = {
 
 
 def _request(url, body=None, retries=3):
-    method = "POST" if body is not None else "GET"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     for attempt in range(retries):
         try:
-            if method == "POST":
-                r = requests.post(url, json=body, headers=HEADERS, timeout=20)
-            else:
-                r = requests.get(url, headers=HEADERS, timeout=20)
-            r.raise_for_status()
-            return r.json()
+            req = urllib.request.Request(
+                url, data=data, headers=HEADERS,
+                method="POST" if body is not None else "GET",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
         except Exception:
             if attempt == retries - 1:
                 raise
@@ -346,8 +342,14 @@ def parse_lease_objects_summary(summary):
 
 
 def _md_cell(text):
-    """md 表格单元格转义: 管道符转义, 空格用 &nbsp; 防止被压缩。"""
-    return str(text or "").replace("|", "\\|").replace(" ", "&nbsp;")
+    """md 表格单元格: 转义管道符/空格 + 轻量清洗(去"广东省"前缀、去重复"深圳市深圳市"、单位 平方米→㎡)。
+
+    清洗对全部单元格安全: 地址/用途文本不含"平方米"单位词; "广东省"前缀仅地址出现。
+    """
+    s = str(text or "")
+    s = s.replace("广东省", "").replace("深圳市深圳市", "深圳市")
+    s = s.replace("平方米", "㎡").replace("元/㎡/月", "元/㎡/月")
+    return s.replace("|", "\\|").replace(" ", "&nbsp;")
 
 
 def query_residential(area_min, area_codes, cutoff, cutoff_end=None):
@@ -401,8 +403,12 @@ def main():
 
     types_to_run = ["住宅公寓", "商业", "办公写字楼"] if args.lease_use_type == "全部" else [args.lease_use_type]
     cutoff_date = args.cutoff[:10]
-    output = args.output or (f"深圳阳光租赁_三类_{cutoff_date}起.xlsx" if args.lease_use_type == "全部"
-                             else f"深圳阳光租赁_{args.lease_use_type}_{cutoff_date}起.xlsx")
+    # 输出目录：技能根/outputs/{日期}/（gitignore 已排除 outputs），按窗口起点日期隔离
+    skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_dir = os.path.join(skill_root, "outputs", cutoff_date)
+    os.makedirs(output_dir, exist_ok=True)
+    output = args.output or (os.path.join(output_dir, f"深圳阳光租赁_三类_{cutoff_date}起.xlsx") if args.lease_use_type == "全部"
+                             else os.path.join(output_dir, f"深圳阳光租赁_{args.lease_use_type}_{cutoff_date}起.xlsx"))
     md_output = output.rsplit(".", 1)[0] + ".md"
 
     all_rows = []
