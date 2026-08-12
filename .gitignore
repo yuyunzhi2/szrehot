@@ -17,17 +17,17 @@ env/
 data/
 daily/
 output/
+outputs/
 
 # 日报输出（本地文件，不纳入版本控制）
 # reports/ 目录下的日报由 dedup 索引引用，但日报本身不入库
 
 # JSON 数据文件（临时采集产物）
 *.json
+!codex_env.json
 
-# 租赁脚本产出（本地文件，不入库）
-深圳阳光租赁_*.xlsx
-深圳阳光租赁_*.md
-深圳阳光租赁_*.txt
+# Tavily 缓存
+tavily_cache/
 
 # IDE
 .vscode/
@@ -43,3 +43,8 @@ Thumbs.db
 # 临时文件
 *.log
 *.tmp
+
+# 租赁产物（旧命名，历史遗留；新脚本输出到 outputs/ 已被忽略）
+深圳阳光租赁_*.xlsx
+深圳阳光租赁_*.md
+深圳阳光租赁_*.txt
