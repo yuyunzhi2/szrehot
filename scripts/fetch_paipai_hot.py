@@ -11,6 +11,9 @@
   - 每个 sheet 取**最后一个日期行**以下（到表尾）的连续数据行 = 当日提取数据
   - 过滤无物业名称 / 无围观人数的垃圾行（含日期块内偶发的残缺行）
   - 按围观人数降序取 TOP5（默认 5 条，--top 可调）
+  - 拍卖开始时间审核（2026-08-19 新增，硬性门槛）：TOP5 的「拍卖开始时间」必须严格晚于
+    技能执行当天日期（开始日期 > 执行日）；已开拍（开始日期 ≤ 执行日）或时间无法解析的
+    物业剔除、不进入 TOP5 排序（--today 可指定审核基准日，默认执行当天）
   - 折价率 = 当前起拍价 / 评估价（自行计算，不读表格中的现成折价率列）
   - 建筑面积 = 打开法拍详情页提取（2026-08-19 新增）：
       * 京东：调公开 JSON 接口 api.m.jd.com queryProductDescription（无需登录），
@@ -63,6 +66,27 @@ def _date_str(v) -> str:
     if isinstance(v, (datetime.datetime, datetime.date)):
         return v.strftime('%Y年%m月%d日')
     return str(v).strip()
+
+
+def parse_start_time(v) -> datetime.date | None:
+    """解析拍卖开始时间 → 日期（仅比较到日期精度）。
+
+    支持 openpyxl 读出的 datetime/date 对象，以及字符串
+    '2026年08月20日 10:00' / '2026-08-20 10:00' / '2026/8/20' 等形态。
+    解析失败（时间未知/乱码）返回 None。
+    """
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.date() if isinstance(v, datetime.datetime) else v
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    m = re.search(r'(\d{4})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})\s*日?', s)
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:  # noqa: BLE001 — 非法日期（如 2月30日）
+        return None
 
 
 def parse_price_to_wan(v):
@@ -386,9 +410,10 @@ def fmt_unit_price(start_wan: float | None, area: float | None) -> str:
 
 
 def _parse_block(ws, date_col: int):
-    """返回 (提取日期字符串, 数据行列表[(名称, url, 起拍价wan, 评估价wan, 开始时间, 围观人数)])。
+    """返回 (提取日期字符串, 数据行列表[(名称, url, 起拍价wan, 评估价wan, 开始时间, 围观人数, 开始日期)]).
 
     取最后一个日期行以下直到表尾的连续数据行；跳过全空行与残缺行。
+    开始日期 = parse_start_time(开始时间)，时间无法解析时为 None。
     """
     last_date_row = None
     last_date = None
@@ -417,16 +442,24 @@ def _parse_block(ws, date_col: int):
             continue
         items.append((str(name).strip(), str(url).strip() if url else '',
                       parse_price_to_wan(start_price), parse_price_to_wan(eval_price),
-                      str(start_time).strip() if start_time else '', views_i))
+                      str(start_time).strip() if start_time else '', views_i,
+                      parse_start_time(start_time)))
     return last_date, items
 
 
-def render_section(xlsx_path: str, top: int, fetch_area: bool = True) -> str:
+def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
+                   today: datetime.date | None = None) -> str:
     """渲染「今日法拍资产热点」章节 md。xlsx 缺失/无日期行时返回说明文字（不抛错）。
+
+    拍卖开始时间审核（2026-08-19 新增，硬性门槛）：仅保留拍卖开始时间**严格晚于执行当天**
+    的物业进入 TOP5——开始日期 ≤ 当天（已开拍/已结束）或时间无法解析者一律剔除，
+    在说明行中计数「剔除 X 条」。无符合条件条目时输出说明文字，不降级放宽。
 
     fetch_area=True 时打开 TOP5 详情页提取建筑面积并计算单价（京东走 API，阿里直连，
     被反爬拦截的面积/单价显示 '-'）；False 时两列均为 '-'（--no-fetch）。
     """
+    if today is None:
+        today = datetime.date.today()
     try:
         import openpyxl
         wb = openpyxl.load_workbook(xlsx_path, data_only=True)
@@ -445,15 +478,23 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True) -> str:
             lines.append(f'### {sheet_name}法拍\n\n今日无提取数据。\n')
             continue
         any_data = True
-        items.sort(key=lambda it: it[5], reverse=True)
-        top_items = items[:top]
+        # 拍卖开始时间审核（硬性门槛）：仅保留开始日期严格晚于执行当天（today）的物业
+        future_items = [it for it in items if it[6] is not None and it[6] > today]
+        excluded = len(items) - len(future_items)
+        if not future_items:
+            lines.append(f'### {sheet_name}法拍\n\n当日 {len(items)} 条物业的拍卖开始时间均不晚于'
+                         f'执行当天（{today}）或时间无法解析，无符合「拍卖开始时间晚于执行日」的标的。\n')
+            continue
+        future_items.sort(key=lambda it: it[5], reverse=True)
+        top_items = future_items[:top]
         lines.append(f'### {sheet_name}法拍（围观 TOP{top}）')
         lines.append('')
-        lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，按围观人数取前 {top} 条。')
+        lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，剔除已开拍/时间无法解析 '
+                     f'{excluded} 条，按围观人数取前 {top} 条（拍卖开始时间均晚于执行当天 {today}）。')
         lines.append('')
         lines.append('| 物业名称 | 当前起拍价 | 评估价 | 折价率 | 建筑面积 | 单价 | 拍卖开始时间 |')
         lines.append('|---|---|---|---|---|---|---|')
-        for name, url, start_p, eval_p, start_time, _v in top_items:
+        for name, url, start_p, eval_p, start_time, _v, _sd in top_items:
             name_cell = f'[{name}]({url})' if url else name
             discount = None
             if start_p is not None and eval_p:
@@ -477,10 +518,13 @@ def main():
                     help='不打开详情页抓取建筑面积（面积/单价列显示 -）')
     ap.add_argument('--area-wait', type=int, default=60,
                     help='阿里详情页需人工验证（登录/滑块）时，弹出浏览器窗口等待的秒数（默认 60）')
+    ap.add_argument('--today',
+                    help='审核基准日 YYYY-MM-DD（默认执行当天；测试用可传未来日期）')
     a = ap.parse_args()
 
     _PW['wait_seconds'] = max(10, a.area_wait)
-    md = render_section(a.xlsx, a.top, fetch_area=not a.no_fetch)
+    today = datetime.date.fromisoformat(a.today) if a.today else datetime.date.today()
+    md = render_section(a.xlsx, a.top, fetch_area=not a.no_fetch, today=today)
     # 清理 Playwright 浏览器会话（有则关）
     # 清理浏览器会话：CDP 连接的主浏览器只关自己开的标签页，不关闭用户浏览器；
     # 自启的 persistent context 关闭时自动保存 profile（登录态跨运行保留）

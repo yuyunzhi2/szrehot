@@ -309,7 +309,8 @@ def main():
     # 今日法拍资产热点（默认必产，调 fetch_paipai_hot.py 获取章节并追加到日报末尾；--no-paipai 关闭）
     if a.paipai_xlsx and not a.no_paipai:
         paipai_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fetch_paipai_hot.py')
-        r = subprocess.run(['python', '-X', 'utf8', paipai_script, '--xlsx', a.paipai_xlsx, '--top', '5'],
+        r = subprocess.run(['python', '-X', 'utf8', paipai_script, 
+'--xlsx', a.paipai_xlsx, '--top', '5', '--today', a.date],
                            capture_output=True, text=True, encoding='utf-8')
         if r.returncode == 0 and r.stdout.strip():
             md = md.rstrip() + '\n\n' + r.stdout.strip().rstrip() + '\n'
