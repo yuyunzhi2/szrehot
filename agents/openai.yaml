@@ -1,5 +1,5 @@
 interface:
-  display_name: "深圳楼市日报"
+  display_name: "深圳资产日报"
   short_description: "深圳房地产每日多源聚合简报"
   brand_color: "#E63946"
-  default_prompt: "生成今天的深圳楼市日报"
+  default_prompt: "生成今天的深圳资产日报"

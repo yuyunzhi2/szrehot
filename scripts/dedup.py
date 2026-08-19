@@ -508,8 +508,8 @@ def stats() -> dict:
 def rebuild_from_reports() -> int:
     """从已有日报文件重建索引"""
     records = []
-    pattern = re.compile(r"深圳楼市日报_(\d{4}-\d{2}-\d{2})\.md")
-    for f in OUTPUT_DIR.glob("深圳楼市日报_*.md"):
+    pattern = re.compile(r"深圳资产日报_(\d{4}-\d{2}-\d{2})\.md")
+    for f in OUTPUT_DIR.glob("深圳资产日报_*.md"):
         m = pattern.match(f.name)
         if not m:
             continue

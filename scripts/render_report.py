@@ -5,11 +5,15 @@
   python -X utf8 scripts/render_report.py --final scripts/_final.json --date 2026-08-11
       [--rentals "scripts/深圳阳光租赁_三类_2026-08-10起.md"] [--rentals-summary "摘要段文字"]
       [--mode daily|jingxuan] [--weekly] [--monthly]
-      [--out D:\\Administrator\\Documents\\大瑀MD\\深圳楼市日报_2026-08-11.md]
+      [--out D:\\Administrator\\Documents\\大瑀MD\\深圳资产日报_2026-08-11.md]
       [--window-start 2026-08-10] [--no-record]
+      [--paipai-xlsx D:\\Desktop\\法拍数据.xlsx]
 
 --final 每条字段: title / url / source / publishedAt(可空) / category /
   summary(50-100字摘要) / sentiment(bullish|bearish|neutral) / weight(1-5)
+
+来源清洗: Google Alerts 通道名（如「Google Alert·深圳 城市更新」）不写入成果文档，
+  渲染时自动提取标题尾部媒体名（「... - 咚咚地产头条」）作为来源；提取不到则省略来源标记。
 
 脚本自动完成:
   - 6 章节分组 + 贯穿全文编号
@@ -30,6 +34,7 @@ import datetime
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -89,6 +94,26 @@ def _to_int(v, default=0):
 
 def _clamp_weight(w: int) -> int:
     return max(1, min(5, w))
+
+
+def _clean_source(raw, title=''):
+    """清洗来源标记：隐藏 Google Alerts / 检索通道名（成果文档不出现 google alert 字样）。
+
+    检索通道形如「深圳 城市更新」「深圳 规划」「深圳 房地产 开发」等，系 S1.5 检索
+    源标记而非真实媒体，不直接展示；优先从标题尾部提取真实媒体名
+    （形如「... - 搜狐」「... - 咚咚地产头条- 深圳房地产信息网」）；提取不到则隐藏。
+    """
+    if not raw:
+        return ''
+    s = str(raw).strip()
+    is_channel = bool(re.search(r'google\s*alerts?', s, flags=re.IGNORECASE)) or \
+        (s.startswith('深圳') and re.search(r'(城市更新|规划|商业|土地|房地产|开发)', s))
+    if is_channel:
+        m = re.search(r'[-–—]\s*([^-–—]+?)\s*$', title or '')
+        if m:
+            return m.group(1).strip()
+        return ''
+    return s
 
 
 def index_band(index: float) -> tuple[str, str]:
@@ -171,6 +196,9 @@ def main():
     ap.add_argument('--weekly', action='store_true', help='追加上周情绪汇总（周一运行）')
     ap.add_argument('--monthly', action='store_true', help='追加上月情绪汇总（每月1日运行）')
     ap.add_argument('--no-record', action='store_true')
+    ap.add_argument('--paipai-xlsx', default=r'D:\Desktop\法拍数据.xlsx',
+                    help='法拍数据.xlsx 路径（默认 D:\\Desktop\\法拍数据.xlsx，默认必产「今日法拍资产热点」章节；传 --no-paipai 关闭）')
+    ap.add_argument('--no-paipai', action='store_true', help='关闭法拍章节（数据源长期不可用时不阻塞）')
     a = ap.parse_args()
 
     today = datetime.date.fromisoformat(a.date)
@@ -194,8 +222,8 @@ def main():
         sections.setdefault(cat, []).append(it)
     seq = 0
     lines = []
-    lines.append(f'**深圳楼市日报 · {today.isoformat()}**' if a.mode == 'daily'
-                 else f'**深圳楼市精选 · {today.isoformat()}**')
+    lines.append(f'**深圳资产日报 · {today.isoformat()}**' if a.mode == 'daily'
+                 else f'**深圳资产精选 · {today.isoformat()}**')
     lines.append('')
     lines.append(f'> 时间窗口：{ws.isoformat()} 00:00 ~ {today.isoformat()} 当前'
                  + ('（周一执行，窗口起点为上周五，跨周末）' if today.weekday() == 0 else ''))
@@ -241,7 +269,12 @@ def main():
                 pub_s = '时间未知'
             sent = normalize_sentiment(it.get('sentiment', 'neutral'))
             w = _clamp_weight(_to_int(it.get('weight'), 1))
-            lines.append(f'{seq}. **{it["title"]}** — {it.get("source", "")}')
+            _src = _clean_source(it.get("source", ""), it.get("title", ""))
+            _title = it["title"]
+            # 去掉标题尾部与来源重复的媒体后缀，避免「标题 - 搜狐 — 搜狐」式重复
+            if _src:
+                _title = re.sub(r'\s*[-–—]\s*' + re.escape(_src) + r'\s*$', '', _title)
+            lines.append(f'{seq}. **{_title}**' + (f' — {_src}' if _src else ""))
             lines.append(f'   {it.get("summary", "")}')
             lines.append(f'   {pub_s} | {SENTIMENT_ICON[sent]} {"★" * w}')
             lines.append(f'   {it["url"]}')
@@ -273,6 +306,16 @@ def main():
 
     md = '\n'.join(lines).rstrip() + '\n'
 
+    # 今日法拍资产热点（默认必产，调 fetch_paipai_hot.py 获取章节并追加到日报末尾；--no-paipai 关闭）
+    if a.paipai_xlsx and not a.no_paipai:
+        paipai_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fetch_paipai_hot.py')
+        r = subprocess.run(['python', '-X', 'utf8', paipai_script, '--xlsx', a.paipai_xlsx, '--top', '5'],
+                           capture_output=True, text=True, encoding='utf-8')
+        if r.returncode == 0 and r.stdout.strip():
+            md = md.rstrip() + '\n\n' + r.stdout.strip().rstrip() + '\n'
+        else:
+            print(f'[paipai] {r.stderr.strip()}')
+
     # 周/月度情绪汇总追加（--weekly/--monthly 时，调 sentiment_log.py）
     sent_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sentiment_log.py')
     for period, flag in (('weekly', a.weekly), ('monthly', a.monthly)):
@@ -284,9 +327,9 @@ def main():
             else:
                 print(f'[{period}] {r.stderr.strip()}')
 
-    out = a.out or (rf'D:\Administrator\Documents\大瑀MD\深圳楼市日报_{today.isoformat()}.md'
+    out = a.out or (rf'D:\Administrator\Documents\大瑀MD\深圳资产日报_{today.isoformat()}.md'
                     if a.mode == 'daily'
-                    else rf'D:\Administrator\Documents\大瑀MD\深圳楼市精选_{today.isoformat()}.md')
+                    else rf'D:\Administrator\Documents\大瑀MD\深圳资产精选_{today.isoformat()}.md')
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, 'w', encoding='utf-8', newline='\n') as f:
         f.write(md)
