@@ -68,11 +68,16 @@ def _date_str(v) -> str:
     return str(v).strip()
 
 
-def parse_start_time(v) -> datetime.date | None:
+def parse_start_time(v, default_year: int | None = None,
+                     after: datetime.date | None = None) -> datetime.date | None:
     """解析拍卖开始时间 → 日期（仅比较到日期精度）。
 
     支持 openpyxl 读出的 datetime/date 对象，以及字符串
     '2026年08月20日 10:00' / '2026-08-20 10:00' / '2026/8/20' 等形态。
+
+    无年份格式（'09月05日 10:00'，京东/阿里法拍列表页默认省略当年年份）：
+    用 default_year（提取日期所在年份）补全；解析出的日期早于 after（提取日期）
+    时自动视为次年（12 月提取看到次年 1 月开拍标的的场景）。
     解析失败（时间未知/乱码）返回 None。
     """
     if isinstance(v, (datetime.datetime, datetime.date)):
@@ -81,12 +86,23 @@ def parse_start_time(v) -> datetime.date | None:
         return None
     s = v.strip()
     m = re.search(r'(\d{4})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})\s*日?', s)
-    if not m:
-        return None
-    try:
-        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:  # noqa: BLE001 — 非法日期（如 2月30日）
-        return None
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:  # noqa: BLE001 — 非法日期（如 2月30日）
+            return None
+    # 无年份格式：'09月05日 10:00' → 继承 default_year（提取日期所在年份）
+    if default_year is not None:
+        m2 = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日', s)
+        if m2:
+            try:
+                d = datetime.date(default_year, int(m2.group(1)), int(m2.group(2)))
+            except ValueError:  # noqa: BLE001 — 非法日期（如 2月30日）
+                return None
+            if after is not None and d < after:
+                d = d.replace(year=d.year + 1)  # 早于提取日 → 跨年标的（次年开拍）
+            return d
+    return None
 
 
 def parse_price_to_wan(v):
@@ -426,6 +442,10 @@ def _parse_block(ws, date_col: int):
     if last_date_row is None:
         return None, []
 
+    # 提取日期（数据块标题行）→ 用于无年份拍卖开始时间补全年份 / 跨年判断
+    extract_date = parse_start_time(last_date)
+    default_year = extract_date.year if extract_date else None
+
     items = []
     for r in range(last_date_row + 1, ws.max_row + 1):
         name = ws.cell(row=r, column=1).value
@@ -443,7 +463,7 @@ def _parse_block(ws, date_col: int):
         items.append((str(name).strip(), str(url).strip() if url else '',
                       parse_price_to_wan(start_price), parse_price_to_wan(eval_price),
                       str(start_time).strip() if start_time else '', views_i,
-                      parse_start_time(start_time)))
+                      parse_start_time(start_time, default_year=default_year, after=extract_date)))
     return last_date, items
 
 
