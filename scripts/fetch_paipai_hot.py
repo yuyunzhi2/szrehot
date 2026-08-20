@@ -160,7 +160,8 @@ _TB_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9',
 }
-_AREA_RE = re.compile(r'建筑面积\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
+# 兼容「建筑面积 78.54㎡」「建筑面积为78.54平方米」「建筑面积约：98.2㎡」等连接写法
+_AREA_RE = re.compile(r'建筑面积\s*(?:为|约|：|:)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 # 多栋合计写法：产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡（取合计 C）
 _AREA_RE_TOTAL = re.compile(r'共\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 
