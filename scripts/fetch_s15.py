@@ -77,9 +77,11 @@ def parse_feed(xml_text, alert_name):
 
         link = link_m.group(1).strip() if link_m else ''
         # Google 重定向 URL，提取 url= 参数获取真实 URL
+        # XML 属性中 & 以 &amp; 实体形式出现，需先还原再做 ?& 匹配
         real_url = link
-        if 'url=' in link:
-            m = re.search(r'[?&]url=([^&]+)', link)
+        link_norm = link.replace('&amp;', '&')
+        if 'url=' in link_norm:
+            m = re.search(r'[?&]url=([^&]+)', link_norm)
             if m:
                 real_url = up.unquote(m.group(1))
 
