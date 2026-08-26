@@ -128,22 +128,18 @@ def parse_price_to_wan(v):
 
 
 def fmt_price_wan(x) -> str:
-    """万元数值 → 展示字符串（≥1亿显示亿，否则万，去尾零）。"""
+    """万元数值 → 展示字符串（纯数字，单位「万元」已入表头；≥1亿换算为万元，去尾零）。"""
     if x is None:
         return '-'
-    if abs(x) >= 10000:
-        s = f'{x / 10000:.2f}'.rstrip('0').rstrip('.')
-        return f'{s}亿'
     s = f'{x:.2f}'.rstrip('0').rstrip('.')
-    return f'{s}万'
+    return f'{s}' if s else '0'
 
 
 def fmt_discount(rate) -> str:
-    """折价率（0.8 → '80%'）。"""
+    """折价率（0.8 → '80'，纯数字，单位「%」已入表头）。"""
     if rate is None:
         return '-'
-    s = f'{rate * 100:.1f}'.rstrip('0').rstrip('.')
-    return f'{s}%'
+    return f'{rate * 100:.1f}'.rstrip('0').rstrip('.')
 
 
 # ---------- 建筑面积提取（2026-08-19 新增） ----------
@@ -369,13 +365,27 @@ def extract_area_tb_playwright(url: str, user_agent: str, timeout: int = 30):
         page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
     except Exception:  # noqa: BLE001 — 超时/跳转异常继续，页面可能已加载
         pass
-    # 本次运行已做过一次完整人工等待：只快速检查一次（若用户之前登录成功则直接命中）
+    # 本次运行已做过一次完整人工等待：短轮询快速检查。
+    # 2026-08-24 教训：此前此处仅 sleep(2) 做单次快照读取——阿里详情页标的
+    # 调查表为异步渲染，冷启动时前几条在 2 秒窗口内读不到「建筑面积」字段，
+    # 导致当日 TOP5 前三条面积全部留空（同榜后两条热身后成功）。
+    # 改为两轮短轮询：每轮最多 8 秒（每 2 秒读一次），首轮失败重新 goto 后再试一轮。
     if _PW['wait_attempted']:
-        time.sleep(2)
-        area = _pw_read_area(page)
-        if area:
-            print(f'[paipai] ✅ 提取到建筑面积 {area}㎡（已登录会话）', file=sys.stderr)
-        return area
+        for attempt in range(2):
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                time.sleep(2)
+                area = _pw_read_area(page)
+                if area:
+                    print(f'[paipai] ✅ 提取到建筑面积 {area}㎡（已登录会话）', file=sys.stderr)
+                    return area
+            if attempt == 0:
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
+                except Exception:  # noqa: BLE001 — 重导航异常继续读当前页
+                    pass
+        print('[paipai] ⏰ 快速轮询仍未提取到建筑面积，该条面积留空。', file=sys.stderr)
+        return None
     # 首次拦截：完整等待用户手动验证
     _PW['wait_attempted'] = True
     state = _pw_page_state(page)
@@ -412,18 +422,40 @@ def extract_area(url: str) -> float | None:
 
 
 def fmt_area(area: float | None) -> str:
-    """建筑面积 → 展示字符串（86.79㎡；None → '-'）。"""
+    """建筑面积 → 展示字符串（纯数字，单位「㎡」已入表头；None → '-'）。"""
     if area is None:
         return '-'
-    return f'{area:.2f}'.rstrip('0').rstrip('.') + '㎡'
+    return f'{area:.2f}'.rstrip('0').rstrip('.')
 
 
 def fmt_unit_price(start_wan: float | None, area: float | None) -> str:
-    """单价 = 当前起拍价(元) / 建筑面积(㎡)，单位元/㎡（四舍五入到元）。"""
+    """单价 = 当前起拍价(元) / 建筑面积(㎡)，纯数字（单位「元/㎡」已入表头，四舍五入到元）。"""
     if start_wan is None or area is None or area <= 0:
         return '-'
-    price = start_wan * 10000 / area
-    return f'{round(price):,}元/㎡'
+    return f'{round(start_wan * 10000 / area):,}'
+
+
+# 物业名称精简（2026-08-26 新增）：只保留位置信息
+_NAME_TAIL_RE = re.compile(r'【[^】]*(?:不动产权证号|产权证)[^】]*】')          # 尾部权证号说明
+_NAME_PREFIX_RE = re.compile(r'^(?:关于)?(?:(?:司法)?拍卖|变卖|竞价)+[::]?\s*')  # 动词前缀
+_NAME_REGION_RE = re.compile(r'^(?:广东省)?(?:深圳市?)?\s*')                     # 行政区划前缀
+
+
+def _clean_name(name) -> str:
+    """物业名称精简：去尾部「【不动产权证号：…】」、去「关于/拍卖/变卖」动词前缀、
+    去「广东省/深圳市」行政区划前缀。清洗后过短（<4字）则回退原名防误伤。"""
+    s = str(name or '').strip()
+    t = _NAME_TAIL_RE.sub('', s)
+    t = _NAME_PREFIX_RE.sub('', t).strip()
+    t = _NAME_REGION_RE.sub('', t).strip(' ，,、；;')
+    return t if len(t) >= 4 else s
+
+
+def _fmt_start_time(start_time: str | None) -> str:
+    """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'），小时不入表。"""
+    if not start_time:
+        return start_time or '-'
+    return re.sub(r'\s*\d{1,2}:\d{2}(?::\d{2})?$', '', str(start_time).strip()) or str(start_time)
 
 
 def _parse_block(ws, date_col: int):
@@ -513,16 +545,16 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
         lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，剔除已开拍/时间无法解析 '
                      f'{excluded} 条，按围观人数取前 {top} 条（拍卖开始时间均晚于执行当天 {today}）。')
         lines.append('')
-        lines.append('| 物业名称 | 当前起拍价 | 评估价 | 折价率 | 建筑面积 | 单价 | 拍卖开始时间 |')
+        lines.append('| 物业名称 | 当前起拍价(万元) | 评估价(万元) | 折价率(%) | 建筑面积(㎡) | 单价(元/㎡) | 拍卖开始时间 |')
         lines.append('|---|---|---|---|---|---|---|')
         for name, url, start_p, eval_p, start_time, _v, _sd in top_items:
-            name_cell = f'[{name}]({url})' if url else name
+            name_cell = f'[{_clean_name(name)}]({url})' if url else _clean_name(name)
             discount = None
             if start_p is not None and eval_p:
                 discount = start_p / eval_p
             area = extract_area(url) if fetch_area and url else None
             lines.append(f'| {name_cell} | {fmt_price_wan(start_p)} | {fmt_price_wan(eval_p)} | '
-                         f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {start_time} |')
+                         f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {_fmt_start_time(start_time)} |')
         lines.append('')
     if not any_data:
         lines.append('今日无法拍资产热点数据。')

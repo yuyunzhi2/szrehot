@@ -23,6 +23,7 @@ import time
 import sys
 import io
 import os
+import re
 import argparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -342,12 +343,14 @@ def parse_lease_objects_summary(summary):
 
 
 def _md_cell(text):
-    """md 表格单元格: 转义管道符/空格 + 轻量清洗(去"广东省"前缀、去重复"深圳市深圳市"、单位 平方米→㎡)。
+    """md 表格单元格: 转义管道符/空格 + 轻量清洗(去"广东省"前缀、去开头"深圳市"、单位 平方米→㎡)。
 
-    清洗对全部单元格安全: 地址/用途文本不含"平方米"单位词; "广东省"前缀仅地址出现。
+    清洗对全部单元格安全: 地址/用途文本不含"平方米"单位词; "广东省"/开头"深圳市"前缀仅地址出现。
+    2026-08-26: 地址统一去掉开头「深圳市」前缀（城区信息由地址中区名承载）。
     """
     s = str(text or "")
     s = s.replace("广东省", "").replace("深圳市深圳市", "深圳市")
+    s = re.sub(r"^深圳市?", "", s.strip())
     s = s.replace("平方米", "㎡").replace("元/㎡/月", "元/㎡/月")
     return s.replace("|", "\\|").replace(" ", "&nbsp;")
 
@@ -501,11 +504,11 @@ def main():
         f.write(f"数据来源: 深圳阳光租赁平台 (listingStartDate >= {args.cutoff[:10]})\n\n")
         f.write(f"筛选规则: 办公写字楼≥{OFFICE_MIN}㎡; 商业/居住类(住宅、公寓等)全部保留\n\n")
         f.write(f"共 {len(df_md)} 个项目, {len(md_rows)} 个标的\n\n")
-        f.write("| 用途类别 | 城区 | 地址 | 面积 | 底价 | 用途 |\n")
-        f.write("|---------|------|------|------|------|------|\n")
+        # 2026-08-26: 表格精简为 地址|面积|底价|用途（用途类别/城区列移除，城区由地址承载）
+        f.write("| 地址 | 面积 | 底价 | 用途 |\n")
+        f.write("|------|------|------|------|\n")
         for row in md_rows:
-            f.write(f"| {_md_cell(row['用途类别'])} | {_md_cell(row['城区'])} | "
-                    f"{_md_cell(row['地址'])} | {_md_cell(row['面积'])} | "
+            f.write(f"| {_md_cell(row['地址'])} | {_md_cell(row['面积'])} | "
                     f"{_md_cell(row['底价'])} | {_md_cell(row['用途'])} |\n")
     print(f"md(办公≥{OFFICE_MIN}㎡+商业+居住, {len(df_md)}项目/{len(md_rows)}标的) → {md_output}")
 

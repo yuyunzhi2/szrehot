@@ -109,7 +109,10 @@ def _clean_source(raw, title=''):
     is_channel = bool(re.search(r'google\s*alerts?', s, flags=re.IGNORECASE)) or \
         (s.startswith('深圳') and re.search(r'(城市更新|规划|商业|土地|房地产|开发)', s))
     if is_channel:
-        m = re.search(r'[-–—]\s*([^-–—]+?)\s*$', title or '')
+        # 仅匹配「标题 - 媒体」式带前导空格的来源后缀；忽略标题内部的
+        # 无空格连字符（如「09-01」「13-12」），避免误把内部连字符后的
+        # 片段当成来源并截断标题。
+        m = re.search(r'\s[-–—]\s*([^-–—]+?)\s*$', title or '')
         if m:
             return m.group(1).strip()
         return ''
@@ -163,6 +166,27 @@ def window_start(d: datetime.date) -> datetime.date:
 
 def fmt_md(d: datetime.date) -> str:
     return f'{d.month}月{d.day}日'
+
+
+_SLIDE_HINT = '<p align="center">左右滑动查看表格</p>'
+_TABLE_SEP_RE = re.compile(r'^\|[\s:|-]+\|\s*$')
+
+
+def add_slide_hints(md_text: str) -> str:
+    """在每个 markdown 表格块前插入居中小字「左右滑动查看表格」（2026-08-26 新增）。
+
+    表格块判定：当前行以 | 开头且下一行为 |---| 分隔行。已有提示则不重复插入。
+    """
+    lines = md_text.split('\n')
+    out: list[str] = []
+    for i, ln in enumerate(lines):
+        is_table_start = ln.lstrip().startswith('|') and i + 1 < len(lines) and bool(_TABLE_SEP_RE.match(lines[i + 1]))
+        prev = out[-1].strip() if out else ''
+        if is_table_start and prev != _SLIDE_HINT:
+            out.append(_SLIDE_HINT)
+            out.append('')
+        out.append(ln)
+    return '\n'.join(out)
 
 
 def extract_rentals_table(md_path: str) -> tuple[list[str], list[str]]:
@@ -331,6 +355,7 @@ def main():
     out = a.out or (rf'D:\Administrator\Documents\大瑀MD\深圳资产日报_{today.isoformat()}.md'
                     if a.mode == 'daily'
                     else rf'D:\Administrator\Documents\大瑀MD\深圳资产精选_{today.isoformat()}.md')
+    md = add_slide_hints(md)  # 所有表格前插入居中「左右滑动查看表格」提示行
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, 'w', encoding='utf-8', newline='\n') as f:
         f.write(md)
