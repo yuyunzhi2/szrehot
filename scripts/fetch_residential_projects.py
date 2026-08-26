@@ -504,12 +504,16 @@ def main():
         f.write(f"数据来源: 深圳阳光租赁平台 (listingStartDate >= {args.cutoff[:10]})\n\n")
         f.write(f"筛选规则: 办公写字楼≥{OFFICE_MIN}㎡; 商业/居住类(住宅、公寓等)全部保留\n\n")
         f.write(f"共 {len(df_md)} 个项目, {len(md_rows)} 个标的\n\n")
-        # 2026-08-26: 表格精简为 地址|面积|底价|用途（用途类别/城区列移除，城区由地址承载）
-        f.write("| 地址 | 面积 | 底价 | 用途 |\n")
+        # 2026-08-26: 表格精简为 地址|面积|底价|用途（用途类别/城区列移除，城区由地址承载）；
+        # 单位统一入表头（面积(㎡)/底价(元/㎡/月)），单元格只写纯数字
+        f.write("| 地址 | 面积(㎡) | 底价(元/㎡/月) | 用途 |\n")
         f.write("|------|------|------|------|\n")
         for row in md_rows:
-            f.write(f"| {_md_cell(row['地址'])} | {_md_cell(row['面积'])} | "
-                    f"{_md_cell(row['底价'])} | {_md_cell(row['用途'])} |\n")
+            # 单位剥离兼容 汉字「平方米」与符号「㎡」两种形态（实测底价多为 元/平方米/月）
+            area_v = re.sub(r"(?:平方米|㎡)\s*$", "", str(row['面积'] or "").strip())
+            price_v = re.sub(r"(?:元/(?:平方米|㎡)/月|元/月)\s*$", "", str(row['底价'] or "").strip())
+            f.write(f"| {_md_cell(row['地址'])} | {_md_cell(area_v)} | "
+                    f"{_md_cell(price_v)} | {_md_cell(row['用途'])} |\n")
     print(f"md(办公≥{OFFICE_MIN}㎡+商业+居住, {len(df_md)}项目/{len(md_rows)}标的) → {md_output}")
 
     # 核对清单
