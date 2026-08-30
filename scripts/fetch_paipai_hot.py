@@ -451,6 +451,93 @@ def _clean_name(name) -> str:
     return t if len(t) >= 4 else s
 
 
+# ---------- 亿元物业归一与汇总（2026-08-31 新增） ----------
+YI_THRESHOLD_WAN = 10000  # 1亿 = 10000万元
+_YI_BASE_RE = re.compile(
+    r"(\d+\s*[栋座幢号楼单元层房室铺号]|"  # 15栋 / 3号楼 / 2单元 / 15层 / 1501房/室
+    r"[A-Z]\s*[栋座]|"                      # A栋 / B座
+    r"[A-Z]\d+\s*[房室]?|"                  # A15房 / B1501室
+    r"之\s*\d+|"                            # 之18
+    r"\d+[A-Z]?\s*房|\d+[A-Z]?\s*室)"                   # 1501房 / 15A房
+)
+
+
+def _base_address(name: str) -> str:
+    """归一基准地址：用于同址多宗合计判定。"""
+    s = _clean_name(name)
+    s = re.sub(r"的房产\s*$", "", s).strip()
+    s = re.sub(r"房产\s*$", "", s).strip()
+    m = _YI_BASE_RE.search(s)
+    if m:
+        base = s[:m.start()].strip(" \uFF0C,\u3001\uFF1B;")
+        if base and base[-1].isalpha() and base[-1].isupper():
+            if re.search(r"^[A-Z]\d+\s*[房室]?", s[m.start():]):
+                base = base[:-1].strip()
+        if len(base) >= 4:
+            return base
+    m2 = re.search(r"\s+\d+\s*$", s)
+    if m2:
+        base = s[:m2.start()].strip()
+        if len(base) >= 4:
+            return base
+    return s
+
+
+def _group_yi_items(items: list) -> list:
+    groups: dict[str, list] = {}
+    for name, url, start_p, eval_p, *_rest in items:
+        if eval_p is None:
+            continue
+        base = _base_address(name)
+        groups.setdefault(base, []).append((name, url, start_p, eval_p))
+    result = []
+    for base, members in groups.items():
+        total = sum(m[3] for m in members)
+        if total >= YI_THRESHOLD_WAN:
+            max_eval = max(m[3] for m in members)
+            members_sorted = sorted(members, key=lambda x: x[3], reverse=True)
+            result.append({
+                "base": base,
+                "count": len(members),
+                "total_eval": total,
+                "max_eval": max_eval,
+                "members": members_sorted,
+            })
+    result.sort(key=lambda g: g["total_eval"], reverse=True)
+    return result
+
+
+def _render_yi_block(groups: list, sheet_name: str) -> list[str]:
+    if not groups:
+        return []
+    lines: list[str] = []
+    lines.append(f"#### {sheet_name}·评估价超亿元物业（单宗≥1亿 / 同址合计≥1亿）")
+    lines.append("")
+    lines.append(f"> 阈值 1亿元（{YI_THRESHOLD_WAN}万元）；归一规则：截断首个栋/座/房/室标识及其后房号，同一基准地址多宗合计≥阈值即入选。共 {len(groups)} 组。")
+    lines.append("")
+    lines.append("| 基准地址 | 宗数 | 评估价合计(万元) | 单宗最高评估价(万元) | 涉及物业明细 |")
+    lines.append("|---|---|---|---|---|")
+    for g in groups:
+        details = []
+        for name, url, start_p, eval_p in g["members"]:
+            clean = _clean_name(name)
+            base = g["base"]
+            suffix = clean[len(base):].strip(" \uFF0C,\u3001") if clean.startswith(base) else clean
+            suffix = re.sub(r"的房产\s*$", "", suffix).strip()
+            suffix = re.sub(r"房产\s*$", "", suffix).strip()
+            if not suffix:
+                suffix = clean
+            disp = f"[{suffix}]({url})" if url else suffix
+            eval_s = fmt_price_wan(eval_p)
+            start_s = fmt_price_wan(start_p) if start_p is not None else "-"
+            details.append(f"{disp} {eval_s}万(起拍{start_s}万)")
+        detail_cell = "<br>".join(details)
+        lines.append(f"| {g['base']} | {g['count']} | {fmt_price_wan(g['total_eval'])} | {fmt_price_wan(g['max_eval'])} | {detail_cell} |")
+    lines.append("")
+    return lines
+
+
+
 def _fmt_start_time(start_time: str | None) -> str:
     """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'），小时不入表。"""
     if not start_time:
@@ -556,6 +643,16 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
             lines.append(f'| {name_cell} | {fmt_price_wan(start_p)} | {fmt_price_wan(eval_p)} | '
                          f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {_fmt_start_time(start_time)} |')
         lines.append('')
+        # 亿元物业汇总（基于当日块全部有效行，不过滤拍卖时间；仅剔除评估价无法解析）
+        yi_groups = _group_yi_items(items)
+        yi_lines = _render_yi_block(yi_groups, sheet_name)
+        if yi_lines:
+            lines.extend(yi_lines)
+        else:
+            eval_valid = sum(1 for _n,_u,_sp,ep,_st,_v,_sd in items if ep is not None)
+            if eval_valid:
+                lines.append(f'> {sheet_name}当日 {eval_valid} 宗评估价可解析物业中，无单宗或同址合计评估价≥1亿元的标的。')
+                lines.append('')
     if not any_data:
         lines.append('今日无法拍资产热点数据。')
         lines.append('')
