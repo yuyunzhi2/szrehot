@@ -1,0 +1,28 @@
+interface:
+  display_name: "深圳资产日报"
+  short_description: "深圳房地产每日多源聚合简报（szrehot）"
+  brand_color: "#E63946"
+  default_prompt: "生成今天的深圳资产日报"
+  version: "2026-08-31"
+  inputs:
+    - name: mode
+      description: "日报模式 daily/jingxuan"
+      required: false
+  outputs:
+    - name: daily_report
+      description: "D:/Administrator/Documents/大瑀MD/深圳资产日报_{date}.md"
+      contract: "6章节 + 情绪指数 + 租赁 + 法拍（含亿元子表）"
+compatibility:
+  canonical_format: markdown
+  adapter_targets: ["opencode"]
+  activation:
+    mode: prompt
+  execution:
+    context: inline
+    shell: bash
+  trust:
+    source_tier: local
+    remote_inline_execution: forbid
+    remote_metadata_policy: allow
+  degradation:
+    opencode: degrade
