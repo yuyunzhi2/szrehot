@@ -133,9 +133,9 @@ def fetch_list_by_use_type(lease_use_type, area_min, area_codes, cutoff=None):
             break
         # 早停: 本页最后一条已早于 cutoff 下界,后续页更早,无需再翻
         if cutoff and content:
-            last_listing = (content[-1].get("listingStartDate") or "").strip()
-            if last_listing and last_listing < cutoff:
-                print(f"  [{lease_use_type}] 早停: 本页末尾 listing={last_listing} < cutoff={cutoff}")
+            newest_listing = (content[0].get("listingStartDate") or "").strip()
+            if newest_listing and newest_listing < cutoff:
+                print(f"  [{lease_use_type}] 早停: 本页最新 listing={newest_listing} < cutoff={cutoff}")
                 break
         page += 1
         time.sleep(0.2)
@@ -164,8 +164,8 @@ def fetch_list_by_name(keyword, area_min, area_codes, cutoff=None):
         if not content or len(items) >= total or page >= 20:
             break
         if cutoff and content:
-            last_listing = (content[-1].get("listingStartDate") or "").strip()
-            if last_listing and last_listing < cutoff:
+            newest_listing = (content[0].get("listingStartDate") or "").strip()
+            if newest_listing and newest_listing < cutoff:
                 print(f"  [名称搜:{keyword}] 早停: listing={last_listing} < cutoff={cutoff}")
                 break
         page += 1
@@ -355,6 +355,152 @@ def _md_cell(text):
     return s.replace("|", "\\|").replace(" ", "&nbsp;")
 
 
+# ---------- 同楼/同项目多宗合并（2026-09-04 新增；归一规则参考法拍2000万汇总） ----------
+_MERGE_BASE_RE = re.compile(
+    r"(\d+\s*号楼|"                        # 3号楼
+    r"\d+\s*[栋座幢楼单元层房室铺]|"            # 15栋 / 8楼 / 3层 / 1501房/室
+    r"[A-Z]\s*[栋座]|"                      # A栋 / B座
+    r"[A-Z]\d+\s*[房室]?|"                # A15房 / B1501室
+    r"之\s*\d+|"                            # 之18
+    r"\d+[A-Z]?\s*房|\d+[A-Z]?\s*室)"   # 1501房 / 15A房
+)
+
+
+def _merge_base(addr: str) -> str:
+    """归一基准地址：去「广东省/深圳市」前缀后截断首个栋/座/幢/层/房/室标识及其后房号。
+
+    如 `广东省深圳市宝安区石街大厦8楼` → `宝安区石街大厦`；归一后过短(<4字)回退原名防误伤。
+    同楼多宗（石街大厦8楼/10楼等）据此判同址，视为一宗。
+    注意：不截断「号」（松岗大道30号是街道门牌，不同门牌=不同楼栋，不得误并）。"""
+    s = str(addr or "").strip().replace("广东省", "").replace("深圳市深圳市", "深圳市")
+    s = re.sub(r"^深圳市?", "", s.strip())
+    m = _MERGE_BASE_RE.search(s)
+    if m:
+        base = s[:m.start()].strip(" ，,、；;")
+        if len(base) >= 4:
+            return base
+    return s
+
+
+def _parse_area_num(area) -> float | None:
+    """面积数值：`1884.7平方米` → 1884.7；解析失败返回 None。"""
+    m = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)", str(area or "").strip())
+    return float(m.group(1)) if m else None
+
+
+def _parse_price_num(price) -> float | None:
+    """底价(元/㎡/月)数值：纯数字直接取；`XX元/月(单价Y元/㎡/月)`取括号单价Y；
+    `…人民币Y元/㎡/月…`取首个Y；解析失败返回 None。"""
+    s = str(price or "").strip()
+    for pat in (r"单价\s*([0-9]+(?:\.[0-9]+)?)",
+                r"人民币\s*([0-9]+(?:\.[0-9]+)?)\s*元/㎡/月",
+                r"([0-9]+(?:\.[0-9]+)?)"):
+        m = re.search(pat, s)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def _fmt_num(x: float) -> str:
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+
+def merge_same_building_rows(rows):
+    """同一栋楼（归一基准地址相同）或同一项目（项目名相同）的多宗视为一宗，合并统计。
+
+    输入 rows: [{项目, 地址, 面积, 底价, 用途}, ...]（每宗一行）。
+    1) 逐字重复的标的先去重——同项目被多用途类别重复命中、或跨项目重复公告，会产生
+       完全相同的行，不得重复计入宗数（如 青湖山庄青泉苑 在办公/商业两类各命中一次）；
+    2) 按 (归一基准地址 | 项目名) 做连通归并：同基准地址或同项目即并为一宗；
+    3) 每组输出一行汇总：地址=基准地址（过短回退项目名）、宗数=N、面积=Σ各宗面积、
+       底价=全部同价→单值 / 有差异→区间（低-高）/ 含无法解析→去重原文，用途=去重合并。
+       单宗行原样保留（宗数=1）。
+    """
+    # 1) 完全重复标的去重
+    seen = set()
+    uniq = []
+    for r in rows:
+        key = (str(r.get("项目", "")), str(r.get("地址", "")), str(r.get("面积", "")).strip(),
+               str(r.get("底价", "")).strip(), str(r.get("用途", "")).strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(dict(r))
+    rows = uniq
+    if not rows:
+        return []
+
+    # 2) 连通归并：同基准地址 或 同项目
+    n = len(rows)
+    parent = list(range(n))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    base_map, proj_map = {}, {}
+    for i, r in enumerate(rows):
+        base = _merge_base(r.get("地址", ""))
+        proj = (r.get("项目") or "").strip()
+        r["_base"] = base
+        r["_proj"] = proj
+        if len(base) >= 4:
+            if base in base_map:
+                _union(i, base_map[base])
+            else:
+                base_map[base] = i
+        if proj:
+            if proj in proj_map:
+                _union(i, proj_map[proj])
+            else:
+                proj_map[proj] = i
+
+    groups: dict[int, list] = {}
+    for i, r in enumerate(rows):
+        groups.setdefault(_find(i), []).append(r)
+
+    # 3) 聚合输出
+    out = []
+    for members in groups.values():
+        if len(members) == 1:
+            m = members[0]
+            out.append({"地址": m["地址"], "宗数": 1, "面积": m["面积"],
+                        "底价": m["底价"], "用途": m["用途"]})
+            continue
+        base = members[0]["_base"] if len(members[0]["_base"]) >= 4 else members[0]["_proj"]
+        area_total, n_area = 0.0, 0
+        prices, raw_prices, uses = [], [], []
+        for m in members:
+            a = _parse_area_num(m.get("面积"))
+            if a is not None:
+                area_total += a
+                n_area += 1
+            p = _parse_price_num(m.get("底价"))
+            if p is not None:
+                prices.append(p)
+            else:
+                raw_prices.append(str(m.get("底价") or "").strip())
+            u = str(m.get("用途") or "").strip()
+            if u and u not in uses:
+                uses.append(u)
+        area_cell = _fmt_num(area_total) if n_area else "-"
+        if prices and not raw_prices:
+            lo, hi = min(prices), max(prices)
+            price_cell = f"{hi:.2f}" if lo == hi else f"{lo:.2f}-{hi:.2f}"
+        else:
+            price_cell = "<br>".join(dict.fromkeys(raw_prices + [f"{p:.2f}" for p in prices])) or "-"
+        use_cell = "<br>".join(uses) if len(uses) > 1 else (uses[0] if uses else "-")
+        out.append({"地址": base, "宗数": len(members), "面积": area_cell,
+                    "底价": price_cell, "用途": use_cell})
+    return out
+
 def query_residential(area_min, area_codes, cutoff, cutoff_end=None):
     """住宅类查询:leaseUseType=住宅公寓 + projectName 搜酒店/宾馆/别墅/庄园,合并去重。"""
     print("[住宅] 路径A: leaseUseType=住宅公寓")
@@ -484,7 +630,7 @@ def main():
         return cat in ("商业", "住宅公寓")
 
     df_md = df[df.apply(_md_keep, axis=1)].copy()
-    # 解析每个项目的 leaseObjects_summary,每个标的拆成一行
+    # 解析每个项目的 leaseObjects_summary,每个标的拆成一行（附 项目 字段供同楼/同项目合并）
     md_rows = []
     for _, r in df_md.iterrows():
         objs = parse_lease_objects_summary(r.get("leaseObjects_summary", ""))
@@ -494,27 +640,33 @@ def main():
             md_rows.append({
                 "用途类别": r["用途类别"],
                 "城区": r.get("城区", ""),
+                "项目": r["projectName"],
                 "地址": o["地址"],
                 "面积": o["面积"],
                 "底价": o["底价"],
                 "用途": o["用途"],
             })
+    # 2026-09-04: 同一栋楼（归一基准地址）或同一项目（projectName）的多宗视为一宗合并统计
+    n_raw = len(md_rows)
+    n_proj = int(df_md["projectName"].nunique())
+    md_rows = merge_same_building_rows(md_rows)
     with open(md_output, "w", encoding="utf-8") as f:
         f.write(f"# 租赁项目清单\n\n")
         f.write(f"数据来源: 深圳阳光租赁平台 (listingStartDate >= {args.cutoff[:10]})\n\n")
         f.write(f"筛选规则: 办公写字楼≥{OFFICE_MIN}㎡; 商业/居住类(住宅、公寓等)全部保留\n\n")
-        f.write(f"共 {len(df_md)} 个项目, {len(md_rows)} 个标的\n\n")
-        # 2026-08-26: 表格精简为 地址|面积|底价|用途（用途类别/城区列移除，城区由地址承载）；
-        # 单位统一入表头（面积(㎡)/底价(元/㎡/月)），单元格只写纯数字
-        f.write("| 地址 | 面积(㎡) | 底价(元/㎡/月) | 用途 |\n")
-        f.write("|------|------|------|------|\n")
+        f.write(f"合并规则: 同一栋楼（归一基准地址）或同一项目（projectName）的多宗视为一宗，提取后合并统计\n\n")
+        f.write(f"共 {n_proj} 个项目, {len(md_rows)} 宗（合并自 {n_raw} 个标的）\n\n")
+        # 2026-08-26: 表格精简（用途类别/城区列移除，城区由地址承载）；单位统一入表头，单元格只写纯数字
+        # 2026-09-04: 新增 宗数 列；同楼/同项目多宗合并为一行汇总（地址=基准地址、面积=合计、底价=单值/区间、用途=去重）
+        f.write("| 地址 | 宗数 | 面积(㎡) | 底价(元/㎡/月) | 用途 |\n")
+        f.write("|---|---|---|---|---|\n")
         for row in md_rows:
             # 单位剥离兼容 汉字「平方米」与符号「㎡」两种形态（实测底价多为 元/平方米/月）
             area_v = re.sub(r"(?:平方米|㎡)\s*$", "", str(row['面积'] or "").strip())
             price_v = re.sub(r"(?:元/(?:平方米|㎡)/月|元/月)\s*$", "", str(row['底价'] or "").strip())
-            f.write(f"| {_md_cell(row['地址'])} | {_md_cell(area_v)} | "
+            f.write(f"| {_md_cell(row['地址'])} | {row['宗数']} | {_md_cell(area_v)} | "
                     f"{_md_cell(price_v)} | {_md_cell(row['用途'])} |\n")
-    print(f"md(办公≥{OFFICE_MIN}㎡+商业+居住, {len(df_md)}项目/{len(md_rows)}标的) → {md_output}")
+    print(f"md(办公≥{OFFICE_MIN}㎡+商业+居住, {n_proj}项目/{len(md_rows)}宗, 合并自{n_raw}标的) → {md_output}")
 
     # 核对清单
     log_path = output.rsplit(".", 1)[0] + "_核对清单.txt"

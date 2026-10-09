@@ -48,3 +48,7 @@ Thumbs.db
 深圳阳光租赁_*.xlsx
 深圳阳光租赁_*.md
 深圳阳光租赁_*.txt
+
+# 本地运行时产物（不入库）
+scripts/.pw_profile/
+scripts/*_bak.py

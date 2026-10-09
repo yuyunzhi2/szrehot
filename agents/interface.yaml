@@ -11,7 +11,7 @@ interface:
   outputs:
     - name: daily_report
       description: "D:/Administrator/Documents/大瑀MD/深圳资产日报_{date}.md"
-      contract: "6章节 + 情绪指数 + 租赁 + 法拍（含亿元子表）"
+      contract: "6章节 + 情绪指数 + 租赁 + 法拍（含2000万子表，单宗≥2000万/同址合计≥2000万汇总呈现）"
 compatibility:
   canonical_format: markdown
   adapter_targets: ["opencode"]

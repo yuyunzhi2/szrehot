@@ -33,6 +33,7 @@
 import argparse
 import datetime
 import io
+import json
 import os
 import re
 import sys
@@ -157,7 +158,76 @@ _TB_HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9',
 }
 # 兼容「建筑面积 78.54㎡」「建筑面积为78.54平方米」「建筑面积约：98.2㎡」等连接写法
-_AREA_RE = re.compile(r'建筑面积\s*(?:为|约|：|:)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
+# Pre-extracted areas from bb-browser (Alibaba x5sec blocks automated extraction)
+_TB_AREA_CACHE = {
+    '1079720849040': 123.89,
+    '1077885467988': 36.73,
+    '1078738322646': 73.05,
+    '1080709676857': 110.19,
+    '1079825461920': 119.06,
+    # 2026-09-04 阿里 TOP5（bb-browser/CDP 提取）
+    '1078755027219': 88.33,
+    '1079671822462': 233.17,
+    '1080679997017': 55.28,
+    '1080637681724': 22.06,
+    '1079668510324': 87.43,
+    # 2026-09-09 阿里（ShadowBot浏览器登录态 + 查档单附件PDF解析，见 scripts/parse_paipai_pdf_areas.py）
+    '1083203804632': 111.82,  # 蔚蓝海岸二期25栋6C，查档单扫描图见证
+    '1081181114988': 143.06,  # 吉祥里豪庭3栋5D，查档单文本
+    '1082220257853': 18499.28,  # 铭德大厦A座401~1801十五套面积求和
+    '1083148196035': 1373.45,  # 竹子林教育科技大厦塔楼04层，查档单文本
+}
+
+
+# ---------- 面积持久 store（2026-09-09 新增，治复跑反复开页） ----------
+# 已确认面积落盘复用：启动时并入 _TB_AREA_CACHE；每次新提取成功写透。
+# 命中缓存的条目不再打开详情页（京东 API 与阿里页面均跳过），复跑即缺件补取。
+_PAIPAI_AREA_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_paipai_area_store.json')
+
+
+def _load_area_store() -> None:
+    try:
+        data = json.load(open(_PAIPAI_AREA_STORE, encoding='utf-8'))
+    except Exception:  # noqa: BLE001 — 首跑无文件
+        return
+    for k, v in (data or {}).items():
+        try:
+            _TB_AREA_CACHE.setdefault(str(k), float(v.get('area') if isinstance(v, dict) else v))
+        except Exception:  # noqa: BLE001 — 脏数据跳过
+            continue
+
+
+def _store_area(item_id: str, area: float, provenance: str) -> None:
+    try:
+        data = json.load(open(_PAIPAI_AREA_STORE, encoding='utf-8'))
+    except Exception:  # noqa: BLE001 — 首跑无文件
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[str(item_id)] = {
+        'area': float(area),
+        'provenance': provenance,
+        'date': datetime.date.today().isoformat(),
+    }
+    try:
+        _TB_AREA_CACHE[str(item_id)] = float(area)
+    except Exception:  # noqa: BLE001
+        pass
+    json.dump(data, open(_PAIPAI_AREA_STORE, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+
+
+def _tb_item_id(url: str) -> str | None:
+    m = re.search(r'/sf_item/(\d+)', url or '')
+    return m.group(1) if m else None
+
+
+_load_area_store()
+
+# 面积前缀：建筑面积/测绘面积优先，兼顾裸「面积 X 平方米」写法
+# （2026-10-01 实测：塘尾新村整栋私宅调查表/公告四处写「面积 1512.29平方米」，
+# 从无建筑面积/测绘面积前缀，老正则全灭）。占地/使用/计租/投影/公摊/套内/分摊
+# 等前缀用定长后顾排除（占地面积是土地面积，绝不可取）。
+_AREA_RE = re.compile(r'(?<!占地)(?<!使用)(?<!计租)(?<!投影)(?<!公摊)(?<!套内)(?<!分摊)(?:建筑面积|测绘面积|面积)[^0-9，。,]{0,6}?([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 # 多栋合计写法：产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡（取合计 C）
 _AREA_RE_TOTAL = re.compile(r'共\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 
@@ -165,8 +235,11 @@ _AREA_RE_TOTAL = re.compile(r'共\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 def _extract_area_text(text: str) -> float | None:
     """从清洗后文本提取建筑面积。优先标准「建筑面积 X 平方米/㎡」；
     多栋合计写法（产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡）取合计 C。"""
-    m = _AREA_RE.search(text)
-    if m:
+    for m in _AREA_RE.finditer(text):
+        # 口径 guard：「套内建筑面积」中的裸「面积」分支会绕过定长后顾，
+        # 统一检查匹配点前 4 字是否含排除前缀（含套内/公摊/使用/占地等）
+        if any(k in text[max(0, m.start() - 4):m.start()] for k in ('套内', '公摊', '使用', '占地', '计租', '投影', '分摊')):
+            continue
         return float(m.group(1))
     if '建筑面积' not in text:
         return None
@@ -187,6 +260,8 @@ def extract_area_jd(url: str, timeout: int = 15):
     if not m:
         return None
     paimai_id = m.group(1)
+    if paimai_id in _TB_AREA_CACHE:  # store 命中直接返回，不再调接口/开页
+        return _TB_AREA_CACHE[paimai_id]
     body = 'body=' + requests.utils.quote('{"paimaiId":"%s","source":5}' % paimai_id)
     try:
         r = requests.post(
@@ -198,6 +273,7 @@ def extract_area_jd(url: str, timeout: int = 15):
         text = re.sub(r'\s+', ' ', text)
         area = _extract_area_text(text)
         if area:
+            _store_area(paimai_id, area, 'jd-api')
             return area
     except Exception:  # noqa: BLE001 — 接口失败走页面回退
         pass
@@ -218,6 +294,8 @@ def extract_area_jd_page(url: str, timeout: int = 20):
         body = page.evaluate('() => document.body ? document.body.innerText : ""')
         area = _extract_area_text(re.sub(r'\s+', ' ', body))
         if area:
+            m2 = re.search(r'/(\d+)(?:\.htm)?(?:\?.*)?$', url.strip())
+            _store_area(m2.group(1) if m2 else url, area, 'jd-page')
             print(f'[paipai] ✅ 京东详情页提取到建筑面积 {area}㎡', file=sys.stderr)
         return area
     except Exception:  # noqa: BLE001 — 页面打开失败降级为 None
@@ -233,6 +311,10 @@ def extract_area_tb(url: str, timeout: int = 15):
     """
     if requests is None:
         return None
+    # Check pre-extracted cache first
+    _m = re.search(r"/sf_item/(\d+)", url)
+    if _m and _m.group(1) in _TB_AREA_CACHE:
+        return _TB_AREA_CACHE[_m.group(1)]
     try:
         r = requests.get(url, headers=_TB_HEADERS, timeout=timeout)
         r.raise_for_status()
@@ -240,7 +322,10 @@ def extract_area_tb(url: str, timeout: int = 15):
         text = re.sub(r'\s+', ' ', text)
         m = _AREA_RE.search(text)
         if m:
-            return float(m.group(1))
+            area = float(m.group(1))
+            if _m:
+                _store_area(_m.group(1), area, 'tb-html')
+            return area
         # 反爬拦截特征（x5sec 滑块页 / 登录跳转页）：含特征关键词且无面积 → 转浏览器人工验证
         blocked = any(k in text for k in ('x5referer', 'x5secdata', '验证码', '滑块'))
         if blocked or 'login' in r.url.lower() or 'havanaone' in r.url.lower():
@@ -252,7 +337,8 @@ def extract_area_tb(url: str, timeout: int = 15):
 
 # Playwright 浏览器实例缓存（模块级，跨 URL 复用会话；登录一次后续 URL 直接可读）
 _PW = {'browser': None, 'context': None, 'page': None, 'wait_seconds': 60,
-       'wait_attempted': False}  # wait_attempted：本次运行是否已做过一次完整人工等待
+       'wait_attempted': False,  # wait_attempted：本次运行是否已做过一次完整人工等待
+       'login_waited': False}  # login_waited：本次运行是否已为登录/滑块做过人工等待
 
 # 真实 Chrome 持久化 profile 目录（登录态/验证状态跨运行保留，登录一次后续免验证）
 _PW_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.pw_profile')
@@ -316,8 +402,16 @@ def _pw_get_page(user_agent: str):
 
 
 def _pw_read_area(page) -> float | None:
-    """从当前页面 innerText 解析「建筑面积」。返回面积或 None。"""
+    """从当前页面 innerText 解析「建筑面积」。返回面积或 None。
+
+    2026-09-25 实测：阿里详情页「标的物介绍」为滚动懒加载，首屏快照无面积
+    （信义荔山御园 1086664377114：首屏 2380 字无面积，滚到底 9866 字才出现
+    「建筑面积 89.48平方米」）。读取前先分步滚到底触发加载再读快照。
+    """
     try:
+        for _ in range(8):
+            page.evaluate('() => window.scrollBy(0, 1500)')
+            time.sleep(0.4)
         body = page.evaluate('() => document.body ? document.body.innerText : ""')
     except Exception:  # noqa: BLE001 — 页面跳转中
         return None
@@ -342,6 +436,99 @@ def _pw_page_state(page) -> str:
     if '建筑面积' in body:
         return 'detail'
     return 'other'
+
+
+# ---------- 附件PDF兜底（2026-09-09 新增） ----------
+# 部分阿里标的（如查档单在附件、整层多单元）的面积不在页面正文，
+# 而在「相关附件下载」PDF（查档单/不动产信息单）中。正文无面积时自动下载解析。
+_ATTACH_KEYWORDS = ('查档单', '不动产信息', '不动产登记', '房产证', '产权证', '评估报告', '测绘')
+_ATTACH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'outputs', 'paipai_attach')
+
+
+def _parse_attach_pdf(path: str) -> float | None:
+    """解析查档单类 PDF：单单元取「单独所有 X 平方米」；多单元求和（如整层拍卖）。"""
+    try:
+        import pdfplumber
+    except ImportError:  # noqa: BLE001 — 无 pdfplumber 时降级留空
+        return None
+    try:
+        with pdfplumber.open(path) as pdf:
+            full = '\n'.join([(pg.extract_text() or '') for pg in pdf.pages])
+    except Exception:  # noqa: BLE001 — 扫描图无文本层/损坏时降级留空
+        return None
+    vals = re.findall(r'单独所有\s*([0-9]+(?:\.[0-9]+)?)\s*平方米', full)
+    if len(vals) == 1:
+        return float(vals[0])
+    if len(vals) > 1:
+        return round(sum(float(v) for v in vals), 2)
+    m = _AREA_RE.search(re.sub(r'\s+', ' ', full))
+    if m:
+        return float(m.group(1))
+    # 测绘报告口径（2026-10-01 实测：塘尾新村整栋私宅测绘报告）：面积统计表
+    # 同一面积值重复出现（「塘尾新村 1512.29 1512.29」），首个重复值即面积合计
+    m = re.search(r'(\d+\.\d+)\s+\1', full)
+    return float(m.group(1)) if m else None
+
+
+def _pw_try_attach_pdf(page, url: str) -> float | None:
+    """附件PDF兜底：下载详情页「相关附件」查档单并解析面积。返回面积或 None。"""
+    item = _tb_item_id(url) or 'unknown'
+    try:
+        links = page.locator("a[href*='download_attach']").all()
+    except Exception:  # noqa: BLE001 — 页面已跳转
+        return None
+    target, tname = None, ''
+    for l in links:
+        try:
+            t = (l.inner_text() or '').strip()
+        except Exception:  # noqa: BLE001 — 元素已失效
+            continue
+        if any(k in t for k in _ATTACH_KEYWORDS):
+            target, tname = l, t
+            break
+    if target is None:
+        return None
+    try:
+        os.makedirs(_ATTACH_DIR, exist_ok=True)
+        dest = os.path.join(_ATTACH_DIR, f'{item}.pdf')
+        with page.expect_download(timeout=20000) as dl_info:
+            target.click()
+        dl_info.value.save_as(dest)
+    except Exception as e:  # noqa: BLE001 — 下载失败降级留空
+        print(f'[paipai] ⚠️ 附件PDF下载失败：{e}', file=sys.stderr)
+        return None
+    area = _parse_attach_pdf(dest)
+    if area:
+        _store_area(item, area, f'pdf-attach:{tname[:40]}')
+        print(f'[paipai] ✅ 附件PDF提取到建筑面积 {area}㎡（{tname[:30]}）', file=sys.stderr)
+    else:
+        print('[paipai] ⏰ 附件PDF未解析到面积（如扫描图无文本层），该条面积留空。', file=sys.stderr)
+    return area
+
+
+def _pw_manual_wait(page, url: str, wait_s: int, state: str) -> float | None:
+    """登录/滑块页人工等待：打印指引并轮询面积至多 wait_s 秒。返回面积或 None。"""
+    if state == 'login':
+        print(f'[paipai] 🔓 阿里需登录淘宝，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
+        print(f'[paipai]    请在弹出窗口中扫码登录淘宝（手机淘宝 App 扫一扫）；登录后自动跳回详情页。', file=sys.stderr)
+        print(f'[paipai]    登录态会保存，下次运行无需重复登录。详情页：{url}', file=sys.stderr)
+    elif state == 'slider':
+        print(f'[paipai] 🔒 阿里详情页触发滑块验证，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
+        print(f'[paipai]    请在弹出窗口中拖动滑块完成验证；验证通过后自动继续。', file=sys.stderr)
+        print(f'[paipai]    详情页：{url}', file=sys.stderr)
+    else:
+        print(f'[paipai] ⏳ 阿里详情页加载中，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
+        print(f'[paipai]    详情页：{url}', file=sys.stderr)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        time.sleep(2)
+        area = _pw_read_area(page)
+        if area:
+            print(f'[paipai] ✅ 人工验证完成，提取到建筑面积 {area}㎡', file=sys.stderr)
+            _store_area(_tb_item_id(url) or url, area, 'tb-browser')
+            return area
+    print(f'[paipai] ⏰ {wait_s} 秒内未完成人工验证，该条面积留空。', file=sys.stderr)
+    return None
 
 
 def extract_area_tb_playwright(url: str, user_agent: str, timeout: int = 30):
@@ -378,47 +565,99 @@ def extract_area_tb_playwright(url: str, user_agent: str, timeout: int = 30):
                 area = _pw_read_area(page)
                 if area:
                     print(f'[paipai] ✅ 提取到建筑面积 {area}㎡（已登录会话）', file=sys.stderr)
+                    _store_area(_tb_item_id(url) or url, area, 'tb-browser')
                     return area
             if attempt == 0:
                 try:
                     page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
                 except Exception:  # noqa: BLE001 — 重导航异常继续读当前页
                     pass
-        print('[paipai] ⏰ 快速轮询仍未提取到建筑面积，该条面积留空。', file=sys.stderr)
-        return None
-    # 首次拦截：完整等待用户手动验证
+        print('[paipai] ⏰ 快速轮询仍未提取到建筑面积。', file=sys.stderr)
+        # 登录 redirect 常发生在 domcontentloaded 之后：复核一次真实状态，
+        # 若已跳登录/滑块且本轮尚未做过人工等待，走一次人工等待而非直接兜底
+        # （2026-09-30 实测：x5sec 风控下连击会被误判为附件型）。
+        state2 = _pw_page_state(page)
+        if state2 in ('login', 'slider') and not _PW.get('login_waited'):
+            _PW['login_waited'] = True
+            area = _pw_manual_wait(page, url, wait_s, state2)
+            if area:
+                return area
+        print('[paipai] 转附件PDF兜底。', file=sys.stderr)
+        return _pw_try_attach_pdf(page, url)
+    # 首次拦截：先看页面状态——已加载但无面积文本（附件型标的）直接走附件PDF兜底，
+    # 不做 60 秒人工等待；仅 login/slider 才完整等待用户手动验证（2026-09-09 优化）。
     _PW['wait_attempted'] = True
     state = _pw_page_state(page)
-    if state == 'login':
-        print(f'[paipai] 🔓 阿里需登录淘宝，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
-        print(f'[paipai]    请在弹出窗口中扫码登录淘宝（手机淘宝 App 扫一扫）；登录后自动跳回详情页。', file=sys.stderr)
-        print(f'[paipai]    登录态会保存，下次运行无需重复登录。详情页：{url}', file=sys.stderr)
-    elif state == 'slider':
-        print(f'[paipai] 🔒 阿里详情页触发滑块验证，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
-        print(f'[paipai]    请在弹出窗口中拖动滑块完成验证；验证通过后自动继续。', file=sys.stderr)
-        print(f'[paipai]    详情页：{url}', file=sys.stderr)
-    else:
-        print(f'[paipai] ⏳ 阿里详情页加载中，已打开浏览器窗口等待最多 {wait_s} 秒。', file=sys.stderr)
-        print(f'[paipai]    详情页：{url}', file=sys.stderr)
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        time.sleep(2)
-        area = _pw_read_area(page)
-        if area:
-            print(f'[paipai] ✅ 人工验证完成，提取到建筑面积 {area}㎡', file=sys.stderr)
-            return area
-    print(f'[paipai] ⏰ {wait_s} 秒内未完成人工验证，该条面积留空。', file=sys.stderr)
+    if state not in ('login', 'slider'):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(2)
+            area = _pw_read_area(page)
+            if area:
+                print(f'[paipai] ✅ 提取到建筑面积 {area}㎡（页面直读）', file=sys.stderr)
+                _store_area(_tb_item_id(url) or url, area, 'tb-browser')
+                return area
+        # 10 秒轮询仍无面积：复核状态（登录 redirect 可能后发先至），
+        # 若已跳登录/滑块则转人工等待，否则走附件PDF兜底。
+        state = _pw_page_state(page)
+        if state not in ('login', 'slider'):
+            return _pw_try_attach_pdf(page, url)
+    _PW['login_waited'] = True
+    area = _pw_manual_wait(page, url, wait_s, state if state in ('login', 'slider') else 'other')
+    if area:
+        return area
     return None
 
 
 def extract_area(url: str) -> float | None:
-    """按 URL 域名分发到对应平台的面积提取器。"""
+    """按 URL 域名分发到对应平台的面积提取器。
+
+    当次运行内失败免重抓（2026-09-30 新增）：同一 URL 在本次运行中已走完完整链路
+    仍未提取到面积时直接返回 None，不重复开页。输出语义不变（仍为 '-'），仅省掉
+    TOP5 与 2000 万块之间对同一 URL 的重复抓取。
+    """
     u = (url or '').strip().lower()
+    if u in _AREA_MISS:
+        return None
     if 'jd.com' in u:
-        return extract_area_jd(url)
-    if 'taobao.com' in u or 'tmall.com' in u:
-        return extract_area_tb(url)
-    return None
+        area = extract_area_jd(url)
+    elif 'taobao.com' in u or 'tmall.com' in u:
+        area = extract_area_tb(url)
+    else:
+        return None
+    if area is None:
+        _AREA_MISS.add(u)
+    return area
+
+
+# 当次运行内已走完链路仍无面积的 URL（免重复开页；进程结束即失效，不落盘）
+_AREA_MISS: set = set()
+
+
+def _load_miss_memo() -> None:
+    """载入当次执行日已验证无面积的 URL 备忘（outputs/_area_miss_*.json，run-scoped）。
+
+    备忘仅收录本执行日内已走完完整链路（页面直读→附件PDF）仍无面积的 URL，
+    输出语义与重抓完全一致（均为 '-'），只为省掉 render 内 TOP5/2000万块的重复开页。
+    面积一律来自脚本链路或面积库，无手填。
+    """
+    import glob as _glob
+    try:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'outputs')
+        for path in sorted(_glob.glob(os.path.join(base, '_area_miss_*.json'))):
+            try:
+                data = json.load(open(path, encoding='utf-8'))
+                urls = data if isinstance(data, list) else data.get('urls', [])
+                for u in urls:
+                    if u:
+                        _AREA_MISS.add(str(u).strip().lower())
+            except Exception:  # noqa: BLE001 — 单个备忘损坏不阻塞
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_load_miss_memo()
 
 
 def fmt_area(area: float | None) -> str:
@@ -451,8 +690,8 @@ def _clean_name(name) -> str:
     return t if len(t) >= 4 else s
 
 
-# ---------- 亿元物业归一与汇总（2026-08-31 新增） ----------
-YI_THRESHOLD_WAN = 10000  # 1亿 = 10000万元
+# ---------- 2000万物业归一与汇总（2026-08-31 新增，2026-09-02 起阈值由1亿调整为2000万） ----------
+YI_THRESHOLD_WAN = 2000  # 2000万 = 2000万元（2026-09-02 起由1亿调整）
 _YI_BASE_RE = re.compile(
     r"(\d+\s*[栋座幢号楼单元层房室铺号]|"  # 15栋 / 3号楼 / 2单元 / 15层 / 1501房/室
     r"[A-Z]\s*[栋座]|"                      # A栋 / B座
@@ -485,11 +724,11 @@ def _base_address(name: str) -> str:
 
 def _group_yi_items(items: list) -> list:
     groups: dict[str, list] = {}
-    for name, url, start_p, eval_p, *_rest in items:
+    for name, url, start_p, eval_p, _st, _v, start_date in items:
         if eval_p is None:
             continue
         base = _base_address(name)
-        groups.setdefault(base, []).append((name, url, start_p, eval_p))
+        groups.setdefault(base, []).append((name, url, start_p, eval_p, start_date))
     result = []
     for base, members in groups.items():
         total = sum(m[3] for m in members)
@@ -507,19 +746,30 @@ def _group_yi_items(items: list) -> list:
     return result
 
 
-def _render_yi_block(groups: list, sheet_name: str) -> list[str]:
+def _render_yi_block(groups: list, sheet_name: str, fetch_area: bool = True) -> list[str]:
+    """评估价超2000万物业汇总块。每个同址分组以单行汇总呈现，含聚合计算：
+    起拍价合计/评估价合计/整体折价率（起拍合计÷评估合计）/建筑面积合计/整体单价（起拍合计÷面积合计）；
+    拍卖开始时间：组内全部同日期 → 单值；跨日期 → 日期区间（最早-最晚）。
+    面积缺失（未提取）时合计列显示 '-'；起拍价缺失的成员不计入起拍合计。
+    """
     if not groups:
         return []
     lines: list[str] = []
-    lines.append(f"#### {sheet_name}·评估价超亿元物业（单宗≥1亿 / 同址合计≥1亿）")
+    lines.append(f"#### {sheet_name}·评估价超2000万物业（单宗≥2000万 / 同址合计≥2000万）")
     lines.append("")
-    lines.append(f"> 阈值 1亿元（{YI_THRESHOLD_WAN}万元）；归一规则：截断首个栋/座/房/室标识及其后房号，同一基准地址多宗合计≥阈值即入选。共 {len(groups)} 组。")
+    lines.append(f"> 阈值 2000万元（{YI_THRESHOLD_WAN}万元）；归一规则：截断首个栋/座/房/室标识及其后房号，同一基准地址多宗合计≥阈值即入选；合计≥2000万的多宗分组以汇总行呈现，并汇总起拍/评估合计、整体折价率与面积单价；组内拍卖开始日期不同则以日期区间展示。共 {len(groups)} 组。")
     lines.append("")
-    lines.append("| 基准地址 | 宗数 | 评估价合计(万元) | 单宗最高评估价(万元) | 涉及物业明细 |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| 基准地址 | 宗数 | 起拍价合计(万元) | 评估价合计(万元) | 折价率(%) | 建筑面积合计(㎡) | 单价(元/㎡) | 拍卖开始时间 | 涉及物业明细 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for g in groups:
         details = []
-        for name, url, start_p, eval_p in g["members"]:
+        start_total = 0.0
+        eval_total = 0.0
+        area_total = 0.0
+        n_area = 0
+        dates = []
+        for member in g["members"]:
+            name, url, start_p, eval_p, start_date = member
             clean = _clean_name(name)
             base = g["base"]
             suffix = clean[len(base):].strip(" \uFF0C,\u3001") if clean.startswith(base) else clean
@@ -531,12 +781,34 @@ def _render_yi_block(groups: list, sheet_name: str) -> list[str]:
             eval_s = fmt_price_wan(eval_p)
             start_s = fmt_price_wan(start_p) if start_p is not None else "-"
             details.append(f"{disp} {eval_s}万(起拍{start_s}万)")
+            if eval_p is not None:
+                eval_total += eval_p
+            if start_p is not None:
+                start_total += start_p
+            if fetch_area and url:
+                area = extract_area(url)
+                if area:
+                    area_total += area
+                    n_area += 1
+            if start_date is not None:
+                dates.append(start_date)
         detail_cell = "<br>".join(details)
-        lines.append(f"| {g['base']} | {g['count']} | {fmt_price_wan(g['total_eval'])} | {fmt_price_wan(g['max_eval'])} | {detail_cell} |")
+        if dates:
+            lo, hi = min(dates), max(dates)
+            lo_s = f"{lo.month:02d}月{lo.day:02d}日"
+            hi_s = f"{hi.month:02d}月{hi.day:02d}日"
+            time_cell = lo_s if lo == hi else f"{lo_s}-{hi_s}"
+        else:
+            time_cell = "-"
+        discount = fmt_discount(start_total / eval_total) if eval_total else "-"
+        area_cell = fmt_area(area_total) if n_area else "-"
+        unit = fmt_unit_price(start_total, area_total) if n_area else "-"
+        lines.append(
+            f"| {g['base']} | {g['count']} | {fmt_price_wan(start_total)} | {fmt_price_wan(eval_total)} | "
+            f"{discount} | {area_cell} | {unit} | {time_cell} | {detail_cell} |"
+        )
     lines.append("")
     return lines
-
-
 
 def _fmt_start_time(start_time: str | None) -> str:
     """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'），小时不入表。"""
@@ -643,15 +915,15 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
             lines.append(f'| {name_cell} | {fmt_price_wan(start_p)} | {fmt_price_wan(eval_p)} | '
                          f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {_fmt_start_time(start_time)} |')
         lines.append('')
-        # 亿元物业汇总（基于当日块全部有效行，不过滤拍卖时间；仅剔除评估价无法解析）
+        # 2000万物业汇总（基于当日块全部有效行，不过滤拍卖时间；仅剔除评估价无法解析；合计≥2000万必须以汇总行呈现）
         yi_groups = _group_yi_items(items)
-        yi_lines = _render_yi_block(yi_groups, sheet_name)
+        yi_lines = _render_yi_block(yi_groups, sheet_name, fetch_area=fetch_area)
         if yi_lines:
             lines.extend(yi_lines)
         else:
             eval_valid = sum(1 for _n,_u,_sp,ep,_st,_v,_sd in items if ep is not None)
             if eval_valid:
-                lines.append(f'> {sheet_name}当日 {eval_valid} 宗评估价可解析物业中，无单宗或同址合计评估价≥1亿元的标的。')
+                lines.append(f'> {sheet_name}当日 {eval_valid} 宗评估价可解析物业中，无单宗或同址合计评估价≥2000万元的标的。')
                 lines.append('')
     if not any_data:
         lines.append('今日无法拍资产热点数据。')

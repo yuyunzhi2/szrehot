@@ -107,7 +107,7 @@ def _clean_source(raw, title=''):
         return ''
     s = str(raw).strip()
     is_channel = bool(re.search(r'google\s*alerts?', s, flags=re.IGNORECASE)) or \
-        (s.startswith('深圳') and re.search(r'(城市更新|规划|商业|土地|房地产|开发)', s))
+        (s.startswith('深圳') and re.search(r'(城市更新|规划|商业|土地|房地产|开发|销售|消费|租金)', s))
     if is_channel:
         # 仅匹配「标题 - 媒体」式带前导空格的来源后缀；忽略标题内部的
         # 无空格连字符（如「09-01」「13-12」），避免误把内部连字符后的
