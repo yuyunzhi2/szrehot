@@ -226,7 +226,7 @@ def main():
     a = ap.parse_args()
 
     today = datetime.date.fromisoformat(a.date)
-    ws = datetime.date.fromisoformat(a['window-start']) if a.window_start else window_start(today)
+    ws = datetime.date.fromisoformat(a.window_start) if a.window_start else window_start(today)
 
     with open(a.final, encoding='utf-8') as f:
         items = json.load(f)
