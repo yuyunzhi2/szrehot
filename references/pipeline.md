@@ -9,8 +9,16 @@
 1. **S1 RSS（备用源，仅 S1.5 失败时启用）**：`python -X utf8 scripts/fetch_s1.py --json -o scripts/_s1.json`。14 路通用财经媒体几乎不产深圳本地新闻，实测连续两日产出 0-4 条且与 S1.5 完全重复（2026-08-12 弃用为常规源）——**默认跳过不跑**；仅当 S1.5 完全失败（代理不可用/无结果）时启用兜底。路由清单见 `references/sources.md`
 2. **S1.5 Google Alerts（主源，必跑）**：`python -X utf8 scripts/fetch_s15.py --json -o scripts/_s15.json`。走 socks5h 代理 `127.0.0.1:10808`；退出码 2 = 代理不可用 → 跳过 S1.5 并在日报注明（排查见 `references/sources.md`）。**S1.5 通过 Google 索引聚合大量微信公众号文章，S2 缺席时实质覆盖微信内容**
 3. **S2 微信（可选）**：Playwright MCP 操作搜狗微信搜索，操作细节与 `var ct` 核验见 `references/weixin-playwright.md`。**不可用时降级链**：搜狗 → 从 `_s15.json` 筛 `mp.weixin.qq.com` URL → 新榜 → 微信搜一搜；全缺则注明「S2 微信渠道未收录」，不阻塞
+    - **⚠️ 搜狗反爬时改走 socks5 代理 + requests（2026-10-22 实测可用）**：浏览器直连 `weixin.sogou.com` 极易触发「请依次点击【璃,缔,怀,忙】」验证码（同一 IP 数次请求即封），而 `https://www.sogou.com/web?query=...`（网页版，非微信版）反而可通。走 `socks5h://127.0.0.1:10808` 代理 + requests 时 `weixin.sogou.com/weixin?type=2` 与 `www.sogou.com/web` 均正常返回。**推荐路径**：① 代理请求 `weixin.sogou.com/weixin?type=2&query={关键词}+2026年&page=N` 取列表；② 列表时间字段是 `document.write(timeConvert('UNIX秒'))`，正则取时间戳 → 北京时间粗筛窗口；③ 解析中间链接 `url += '...'` 片段拼出签名 URL（**勿 unescape**，见 troubleshooting）；④ 抓签名 URL 提 `var ct` + 正文。
+    - **签名链接即最终产物**：日报只要求「可点击的 mp.weixin.qq.com 链接」，`?src=11&timestamp=...&signature=...` 满足要求（2026-08-26 日报即此格式）。**不要为"解出永久 URL"反复重写脚本**——`sn` 为空、无法拼接，代价极高而收益为零。拿到 `var ct` + 全文即推进下一环节
 
 ### 阶段 B：核验 + 过滤（产物 `scripts/_pre_cands.json` → `scripts/_candidates.json` → `scripts/_dedup_result.json`）
+
+> **执行顺序纪律（2026-10-22 复盘新增，违反将导致返工）**：
+> ① **开工先读一份成功的先例**（上一份日报的链接格式/章节结构/摘要粒度）直接对齐，不重新发明；
+> ② **跨日索引扫描必须前移到写摘要之前**（关键词扫 `dedup_index.jsonl` 最近 7 天，命中候选人工打开前日日报核对关键数字）——先写完摘要再查索引将被迫回退 `dedup_index.jsonl`+`sentiment_log.jsonl` 并重渲染（法拍面积重跑）；
+> ③ **任何子目标最多 2 次尝试**，失败即取"能用的近似"并在日报注明限制后推进（例：搜狗微信签名链接即满足"可点击的 mp.weixin.qq.com 链接"要求，不追永久链接）；
+> ④ **只用脚本文件，不在 PowerShell 里内联 python**（含 `['"]` 的正则必然被 shell 解析破坏）。
 
 4. **三源合并 + 关键词筛选**：S1/S1.5 从脚本 JSON 读取，S2 由主模型整理，统一字段 `title/url/source/publishedAt`。先做关键词筛选（剔除楼盘详情页软文/中介软文/纯股价噪音，仅留市场相关），写入 `scripts/_pre_cands.json`（可含重复多稿，去重在后）
     - **⚠️ URL 必须在最上游统一解包**（2026-08-19 踩坑）：S1.5 的 URL 是 Google Alerts 包装链接（`google.com/url?q=<真实URL>`）。**解包动作只能在 fetch_s15.py 内做一次**，下游所有脚本（verify_times/dedup/build_candidates/render）假设 URL 已是真实地址。若 `_time_verified.json` 仍含包装 URL 而 dedup 结果已解包，`build_candidates.py` 按 URL 匹配去重会**全部失效、剔除项回流**（本次实测 _final.json 一度 44 条而非 24 条）。兜底修复：改用 `_candidates.json`（已解包）+ `_dedup_result.json` 直接合成，不再依赖 `_time_verified.json` 的 URL
@@ -21,6 +29,7 @@
 9. **跨源去重**：`python -X utf8 scripts/dedup.py batch-check --input scripts/_candidates.json --date {今天} --output scripts/_dedup_result.json`。剔除 `is_duplicate=true` 的条目。**DUP 语义（易误解）**：`is_duplicate=true` = 该条与已存在条目重复，**应剔除**，不是"已收录所以保留"。批内重复只留先出现的一条；跨日重复（`index_*`）默认剔除，除非本次是重新生成当日日报且该条重新核验后仍在窗口内。**五轨机制**见 `references/classification.md`：
     - 轨1 URL 指纹 / 轨2 标题 2-gram / 轨3 实体组合（公司+区+事件+类型，含条件4：共同公司+共同类型判重）/ 轨4 结构化标题 / **轨5 实体指纹（2026-08-12 新增）**
     - **轨5 实体指纹**：解决"同一事件不同媒体标题"（深大购楼 4 稿、香蜜湖宅地 3 稿标题差异极大，轨2/3/4 全漏，过去靠主模型人工合并）。机制：① 金额/数量指纹归一化（`5.3亿→(亿,5)`、`5.336亿→(亿,5)`，带小数金额=强信号直接判重，整数金额需实体上下文佐证）；② 标题 6-gram Jaccard ≥0.35（专有名词级重合，如"红山中学民治校区"）。**主模型仍应人工复核去重结果**——指纹轨是辅助，极端改写标题（如每经"深圳大学打算买一整栋楼做学生宿舍" vs 新浪"深大再出手…5.3亿…"）靠轨3条件4（深大≡深大 + 宿舍类型）
+    - **⚠️ 跨日同源改写必须人工比对前日日报全文（2026-10-22 踩坑）**：`batch-check` 的跨日索引**只比对标题/URL/实体指纹，不比对正文数字**，五轨会全部漏判同事件换角度改写。实测：今日 szhome《8.42公顷、深圳又一次4宗地成交！宝安又迎半导体公司》vs 昨日凤凰《供应节奏加快深圳产业用地市场升温》——标题完全不同，但 8.42 公顷 / 6140 万沛顿 / 飞托克 753 万逐个数字对得上，是同一事件。**跨日去重不能只靠 `batch-check` 结果，必须人工打开前日日报对应条目核对关键数字**；此类条目要剔除，不得因"换了角度/换了媒体"当新增。高频同源场景：人才房/保障房批次公告、楼面价土拍、法拍成交、中指/统计局月度数据发布
     - **⚠️ 同 URL 多条记录 dict 覆盖**（2026-08-19 踩坑）：batch-check 结果中同一 URL 可能出现多条记录（跨日索引 + 当日候选），合并写 dict 时后者覆盖前者且可能覆盖掉应保留的记录。**合成逻辑必须显式「优先保留 `is_duplicate=false` 的记录，再保留 `is_duplicate=true`」，不能依赖遍历顺序**
     去重结果即阶段C样板生成器（步骤10）的输入，无需再存 _checked.json
 

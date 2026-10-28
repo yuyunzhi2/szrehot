@@ -2,6 +2,29 @@
 
 搜狗微信搜索必须用真实浏览器渲染（纯 curl 拿不到文章列表）。opencode 环境下用 **Playwright MCP**。
 
+## 优先路径：socks5 代理 + requests（2026-10-22 实测，浏览器被反爬时走这条）
+
+浏览器直连 `weixin.sogou.com` **极易触发验证码**（实测数次请求即跳「请依次点击【璃,缔,怀,忙】」）。走 `socks5h://127.0.0.1:10808` 代理 + requests 时，微信版与网页版搜狗均正常返回，**无需真实浏览器**。
+
+```python
+P = {'http': 'socks5h://127.0.0.1:10808', 'https': 'socks5h://127.0.0.1:10808'}
+s = requests.Session(); s.proxies.update(P)
+s.headers.update({'User-Agent': 'Mozilla/5.0 ... Chrome/126.0 Safari/537.36'})
+surl = ('https://weixin.sogou.com/weixin?type=2&query='
+        + urllib.parse.quote('深圳楼市 2026年') + '&ie=utf8&page=1')
+t = s.get(surl, timeout=30).text
+```
+
+四个要点：
+
+1. **列表时间字段是 `document.write(timeConvert('UNIX秒'))`**，不是可读日期。正则 `timeConvert\('(\d{10})'\)` 取时间戳 → 转北京时间做窗口粗筛。
+2. **中间链接要拼片段**：搜狗跳页把 URL 拆成 `url += 'https://mp.'` / `url += 'weixin.qq.c'` / `url += '&timestamp='` … 用正则取全部片段后 **直接 `''.join()`**。
+   - **⚠️ 绝不可对整段做 `html.unescape`**：`&timestamp` 里的 `&times` 会被解析成实体 `×`，得到 `&tamp=...` 坏链接。
+3. **签名 URL 即最终产物**：`mp.weixin.qq.com/s?src=11&timestamp=...&signature=...` 是日报要求的可点击链接。`sn` 为空、**无法拼出永久链接，不要为此重写脚本**。
+4. **正文与时间一次取全**：抓签名 URL → 正则 `var\s+ct\s*=\s*["\']?(\d{10})` 取发布时间戳（最可靠）+ `<meta property="og:title">` 取标题 + 剥标签取正文。
+
+网页版 `https://www.sogou.com/web?query=...` 可作补充：它会直接渲染出文章正文与 `mp.weixin.qq.com` 链接，但**搜不到微信站内独有内容**，且反爬阈值更低。
+
 ## bb-browser → Playwright MCP 工具映射
 
 | bb-browser（Claude Code） | Playwright MCP（opencode） |
