@@ -1,6 +1,7 @@
 # 流水线详规（四阶段 15 步）
 
 > 轻量 SKILL.md 的按需展开；执行时按阶段产物校验是否齐全。
+> 本文件对应每日链**步骤 3**。步骤 1（京东法拍采集）见 `references/jd-paipai.md`，步骤 2（深圳法拍资产日报）见 `references/fapai-daily.md`，两步由 `scripts/run_daily_chain.py` 一键执行，跑完再进入本流水线。
 
 ## 四阶段流程（每阶段一个明确产物）
 

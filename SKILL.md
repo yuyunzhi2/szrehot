@@ -1,11 +1,34 @@
 ---
 name: szrehot
-description: "深圳房地产每日多源聚合简报。触发词：深圳楼市/深圳房价/深圳土拍/深圳买房/深圳城市更新/深圳旧改/深圳地产新闻/深圳楼市日报/深圳房产资讯/深圳保障房/深圳公积金/深圳标杆房企/万科/华润置地/招商蛇口。即使用户只说'深圳楼市'或'今天有什么'且上下文是深圳房产，也必须触发。不要 undertrigger——用户问深圳房产资讯而不用本 Skill 等于用过时训练数据当今日新闻。"
+description: "深圳房地产每日多源聚合简报 + 法拍数据链。触发词：深圳楼市/深圳房价/深圳土拍/深圳买房/深圳城市更新/深圳旧改/深圳地产新闻/深圳楼市日报/深圳房产资讯/深圳保障房/深圳公积金/深圳标杆房企/万科/华润置地/招商蛇口/京东法拍/法拍数据/法拍资产日报/生成日报。用户直接调用本技能且附加提示词为空或为「生成日报」时，按固定顺序跑完整每日链：京东法拍采集 → 深圳法拍资产日报 → 深圳资产日报。即使用户只说'深圳楼市'或'今天有什么'且上下文是深圳房产，也必须触发。不要 undertrigger——用户问深圳房产资讯而不用本 Skill 等于用过时训练数据当今日新闻。"
 ---
 
-# 深圳资产日报（szrehot · opencode 版）
+# 深圳资产日报（szrehot · 三阶每日链）
 
-> 聚合多源公开数据，生成深圳房地产每日 markdown 简报。无自建后端，客户端侧合成。
+> 聚合多源公开数据 + 法拍数据链，生成深圳房地产每日 markdown 简报。无自建后端，客户端侧合成。
+
+## 每日链（默认执行路径）
+
+用户直接调用本技能（附加提示词为空 / 「生成日报」）→ **今日 + 全链**。三步固定顺序执行，共用同一份 `法拍数据.xlsx`：步骤 1 写 `京东API`/`京东成交API`（归档全量），步骤 2/3 读 `京东`/`阿里`/`京东成交`/`阿里成交`（人工策划口径）。
+
+| 步骤 | 内容 | 来源 | 产物 |
+|---|---|---|---|
+| 1 京东法拍采集 | `api.m.jd.com` 全量抓深圳在售/成交，按日期块追加写 xlsx | 原 jd-paipai | `法拍数据.xlsx` 的 `京东API` / `京东成交API` |
+| 2 深圳法拍资产日报 | 读当日块出四张表（阿里/京东 新增关注 + 成交 top10） | 原 shenzhen-fapai-daily | `大瑀MD/深圳法拍资产日报-{date}.md` |
+| 3 深圳资产日报 | 新闻六章节 + 情绪指数 + 大宗租赁 + 法拍热点 | 本技能五阶段 A-E | `大瑀MD/深圳资产日报_{date}.md` |
+
+```bash
+# 工作目录 = 技能目录；步骤 1+2 一键，步骤 3 按下方五阶段骨架由主模型执行
+python -X utf8 scripts/run_daily_chain.py            # 今天，前两步
+python -X utf8 scripts/run_daily_chain.py --dry-run  # 只抓不写 xlsx，法拍日报落临时目录
+python -X utf8 scripts/run_daily_chain.py --skip-jd  # 只重出法拍日报
+python -X utf8 scripts/run_daily_chain.py --force    # 当日块已存在也重跑步骤 1
+```
+
+- **幂等**：步骤 1 目标 sheet 已有当日日期行时跳过（原实现每次写日期行，日内重复执行会多出空块）；`--force` 强制重跑。
+- **失败不阻塞**：步骤 1/2 任一失败仍继续后续，在交付中注明缺失环节，**不得编造法拍数据**。
+- **提示词指定范围**时按指定执行，不套全链：如「只出法拍日报」→ `--skip-jd` 后只交付步骤 2；「补 10-27」→ `--date 2026-10-27`。
+- **交付**：步骤 3 完成后把**两份 md**（法拍资产日报 + 深圳资产日报）路径一起报给用户，深圳资产日报正文按步骤 3 规则原样粘贴。
 
 ## 执行纪律（2026-10-22 复盘新增，违反直接导致返工/超时）
 
@@ -18,13 +41,14 @@ description: "深圳房地产每日多源聚合简报。触发词：深圳楼市
 
 ## 何时触发
 
-用户提及上述触发词，或上下文为深圳房产资讯时**必触发**。仅解释/翻译/总结单篇时不触发（`Do not create a skill` 情形）。
+用户提及上述触发词，或上下文为深圳房产资讯时**必触发**；提示词为空 / 「生成日报」也按每日链执行。
+仅解释/翻译/总结单篇时不触发（`Do not create a skill` 情形）。
 
 ## 执行契约
 
-- **owner** `yuyunzhi2` · 月审 · **file-backed fixture** `D:\Desktop\法拍数据.xlsx` + `scripts/_*.json`
-- **output contract** `大瑀MD/深圳资产日报_{date}.md` + `outputs/{窗口起点}/` + `sentiment_log.jsonl` + 周一加 `大瑀MD/深圳资产周报_{上周一起}_{上周日}.md`
-- **rollback** `render --no-record` 可重渲染；`missing evidence` 无遥测，仅本地文件为凭
+- **owner** `yuyunzhi2` · 月审 · **file-backed fixture** `D:\Desktop\法拍数据.xlsx` + `scripts/_*.json` + `scripts/jd_paipai/_jd_cache.json`
+- **output contract** `大瑀MD/深圳法拍资产日报-{date}.md` + `大瑀MD/深圳资产日报_{date}.md` + `outputs/{窗口起点}/` + `sentiment_log.jsonl` + 周一加 `大瑀MD/深圳资产周报_{上周一起}_{上周日}.md`
+- **rollback** 步骤 1 追加写：按日期行定位删除当日块即回滚（实写前先 `--dry-run`）；步骤 3 `render --no-record` 可重渲染；`missing evidence` 无遥测，仅本地文件为凭
 
 ## 环境
 
@@ -32,7 +56,7 @@ description: "深圳房地产每日多源聚合简报。触发词：深圳楼市
 - 语义→主模型，确定性→脚本；hook 拦截时用 `python -X utf8 -c "print(open(...).read())"`
 - 阿里法拍浏览器固定用 ShadowBot：`"D:\Program Files\ShadowBot\ShadowBot Browser\Application\ShadowBotBrowser.exe" --remote-debugging-port=9222 --user-data-dir=C:\ChromeDebug`（`scripts/start_chrome_debug.bat` 一键启动，**禁 taskkill 用户主浏览器**）；淘宝登录态存 `C:\ChromeDebug` 跨 run 复用，失效时从 `%LOCALAPPDATA%\ShadowBotBrowser\User Data` 拷登录文件（robocopy 排除缓存/锁文件）或弹窗扫码一次
 
-## 五阶段骨架（周一加 E 周报）
+## 阶段 3 骨架：五阶段（周一加 E 周报）
 
 > 详表与参数见 `references/pipeline.md`；踩坑对照见 `references/troubleshooting.md`
 
@@ -72,15 +96,19 @@ description: "深圳房地产每日多源聚合简报。触发词：深圳楼市
 ## 红线
 
 - 窗口外丢弃不降权；去重覆盖全源；顺序 时效/地域→去重→情绪；`var ct`后判时效；重跑=重走管道
+- 每日链顺序固定 1→2→3，不得跳步或并行；步骤 1 实写前先 `--dry-run`（首次接入/换数据源时）
 
 ## References
 
-- `references/pipeline.md` 15步流水线（含2000万分组）
+- `references/jd-paipai.md` 步骤 1 京东法拍采集：双轨/块格式/16列/API/踩坑
+- `references/fapai-daily.md` 步骤 2 深圳法拍资产日报：四表入选/清洗/行序/回退规则
+- `references/pipeline.md` 步骤 3 十五步流水线（含2000万分组）
 - `references/weekly.md` 周一E周报流程（跨日去重+合并表+五节结构）
 - `references/troubleshooting.md` 踩坑速查
 - `references/output-spec.md` 表格与法拍经验
 - `references/classification.md` 六类+五轨
 - `references/sources.md` · `references/weixin-playwright.md`
+- `scripts/run_daily_chain.py` · `scripts/jd_paipai/` · `scripts/generate_fapai_daily.py`
 - `scripts/fetch_paipai_hot.py` · `scripts/parse_paipai_pdf_areas.py` · `scripts/_paipai_area_store.json` · `scripts/sentiment_log.py`
 - `evals/trigger_eval.py` 触发评测 · `reports/output_quality_scorecard.md` 质检
 
@@ -93,4 +121,4 @@ description: "深圳房地产每日多源聚合简报。触发词：深圳楼市
 - 暴露基础设施（feed/API/工具名）在日报正文；漏 URL/不可点击链接
 - 情绪全标中性或手写情绪指数；把租赁计入指数；伪造 `sentiment_log.jsonl`
 - 周报展开每日法拍TOP5全量（约60行）或重算情绪/改写日报表格数值；脑补旧日报缺失列
-
+- 跳过每日链顺序（1→2→3）直接交付；手填 `京东API`/`京东成交API` 的历史块

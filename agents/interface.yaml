@@ -1,16 +1,19 @@
 interface:
   display_name: "深圳资产日报"
-  short_description: "深圳房地产每日多源聚合简报（szrehot）"
+  short_description: "深圳房地产每日多源聚合简报（szrehot）· 三阶每日链"
   brand_color: "#E63946"
-  default_prompt: "生成今天的深圳资产日报"
-  version: "2026-08-31"
+  default_prompt: "生成日报"
+  version: "2026-10-28"
   inputs:
     - name: mode
-      description: "日报模式 daily/jingxuan"
+      description: "日报模式 daily/jingxuan；附加提示词为空或「生成日报」时跑完整每日链"
       required: false
   outputs:
+    - name: fapai_daily
+      description: "D:/Administrator/Documents/大瑀MD/深圳法拍资产日报-{date}.md（每日链步骤 2）"
+      contract: "四张表：阿里/京东 新增关注top10 + 阿里/京东 成交top10，含数据日期与回退标注"
     - name: daily_report
-      description: "D:/Administrator/Documents/大瑀MD/深圳资产日报_{date}.md"
+      description: "D:/Administrator/Documents/大瑀MD/深圳资产日报_{date}.md（每日链步骤 3）"
       contract: "6章节 + 情绪指数 + 租赁 + 法拍（含2000万子表，单宗≥2000万/同址合计≥2000万汇总呈现）"
 compatibility:
   canonical_format: markdown
