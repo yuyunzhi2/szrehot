@@ -51,9 +51,26 @@ DEFAULT_XLSX = r'D:\Desktop\法拍数据.xlsx'
 SHEETS = [('京东', 2), ('阿里', 1)]
 
 
+def _is_date_serial(v) -> bool:
+    """识别 Excel 日期序列号（2026-10-xx 起京东新格式：日期分隔行写在 A 列，如 46305=2026-10-10）。"""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return 45000 <= int(v) <= 55000  # ≈2023-03 ~ 2050-07，防误伤普通数字
+    return False
+
+
+def _serial_to_str(v) -> str:
+    n = int(v)
+    return (datetime.date(1899, 12, 30) + datetime.timedelta(days=n)).strftime('%Y年%m月%d日')
+
+
 def _is_date_cell(v) -> bool:
-    """识别日期单元格：datetime/date 或 '2026年08月03日'/'2026-08-03' 字符串。"""
+    """识别日期单元格：datetime/date、'2026年08月03日'/'2026-08-03' 字符串、
+    Excel 日期序列号（2026-10-xx 起京东新格式分隔行在日期列，如 46305=2026-10-10）。"""
     if isinstance(v, (datetime.datetime, datetime.date)):
+        return True
+    if _is_date_serial(v):
         return True
     if isinstance(v, str):
         s = v.strip()
@@ -63,9 +80,11 @@ def _is_date_cell(v) -> bool:
 
 
 def _date_str(v) -> str:
-    """日期单元格 → 显示字符串。"""
+    """日期单元格 → 显示字符串（兼容 Excel 序列号）。"""
     if isinstance(v, (datetime.datetime, datetime.date)):
         return v.strftime('%Y年%m月%d日')
+    if _is_date_serial(v):
+        return _serial_to_str(v)
     return str(v).strip()
 
 
@@ -79,6 +98,9 @@ def parse_start_time(v, default_year: int | None = None,
     无年份格式（'09月05日 10:00'，京东/阿里法拍列表页默认省略当年年份）：
     用 default_year（提取日期所在年份）补全；解析出的日期早于 after（提取日期）
     时自动视为次年（12 月提取看到次年 1 月开拍标的的场景）。
+    新格式后缀（2026-10-10 起京东）：
+    '11月11日 10:00:00开始' → 正常解析为开始日期；
+    '预计10月24日 10:00:00结束' → 只有结束时间、无开始信息，返回 None（依法剔除出 TOP5）。
     解析失败（时间未知/乱码）返回 None。
     """
     if isinstance(v, (datetime.datetime, datetime.date)):
@@ -86,6 +108,8 @@ def parse_start_time(v, default_year: int | None = None,
     if not isinstance(v, str):
         return None
     s = v.strip()
+    if '结束' in s:
+        return None  # 只有结束时间（如'预计10月24日 10:00:00结束'），开始时间未知
     m = re.search(r'(\d{4})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})\s*日?', s)
     if m:
         try:
@@ -226,8 +250,10 @@ _load_area_store()
 # 面积前缀：建筑面积/测绘面积优先，兼顾裸「面积 X 平方米」写法
 # （2026-10-01 实测：塘尾新村整栋私宅调查表/公告四处写「面积 1512.29平方米」，
 # 从无建筑面积/测绘面积前缀，老正则全灭）。占地/使用/计租/投影/公摊/套内/分摊
-# 等前缀用定长后顾排除（占地面积是土地面积，绝不可取）。
-_AREA_RE = re.compile(r'(?<!占地)(?<!使用)(?<!计租)(?<!投影)(?<!公摊)(?<!套内)(?<!分摊)(?:建筑面积|测绘面积|面积)[^0-9，。,]{0,6}?([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
+# 等前缀用定长后顾排除（占地/宗地面积是土地面积，绝不可取）。
+# （2026-10-15 实测：碧华庭居1栋A1603公告页「宗地面积 30211.67平方米」被裸「面积」
+# 分支误取，正确单套面积105.78㎡在后文；新增宗地排除）
+_AREA_RE = re.compile(r'(?<!占地)(?<!宗地)(?<!使用)(?<!计租)(?<!投影)(?<!公摊)(?<!套内)(?<!分摊)(?:建筑面积|测绘面积|面积)[^0-9，。,]{0,6}?([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 # 多栋合计写法：产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡（取合计 C）
 _AREA_RE_TOTAL = re.compile(r'共\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 
@@ -238,7 +264,7 @@ def _extract_area_text(text: str) -> float | None:
     for m in _AREA_RE.finditer(text):
         # 口径 guard：「套内建筑面积」中的裸「面积」分支会绕过定长后顾，
         # 统一检查匹配点前 4 字是否含排除前缀（含套内/公摊/使用/占地等）
-        if any(k in text[max(0, m.start() - 4):m.start()] for k in ('套内', '公摊', '使用', '占地', '计租', '投影', '分摊')):
+        if any(k in text[max(0, m.start() - 4):m.start()] for k in ('套内', '公摊', '使用', '占地', '宗地', '计租', '投影', '分摊')):
             continue
         return float(m.group(1))
     if '建筑面积' not in text:
@@ -676,7 +702,7 @@ def fmt_unit_price(start_wan: float | None, area: float | None) -> str:
 
 # 物业名称精简（2026-08-26 新增）：只保留位置信息
 _NAME_TAIL_RE = re.compile(r'【[^】]*(?:不动产权证号|产权证)[^】]*】')          # 尾部权证号说明
-_NAME_PREFIX_RE = re.compile(r'^(?:关于)?(?:(?:司法)?拍卖|变卖|竞价)+[::]?\s*')  # 动词前缀
+_NAME_PREFIX_RE = re.compile(r'^(?:关于)?(?:[一二三四五]\s*拍|(?:司法)?拍卖|变卖|竞价)+[::]?\s*')  # 动词前缀（2026-10-10 兼容京东“一拍/二拍”前缀）
 _NAME_REGION_RE = re.compile(r'^(?:广东省)?(?:深圳市?)?\s*')                     # 行政区划前缀
 
 
@@ -811,17 +837,67 @@ def _render_yi_block(groups: list, sheet_name: str, fetch_area: bool = True) -> 
     return lines
 
 def _fmt_start_time(start_time: str | None) -> str:
-    """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'），小时不入表。"""
+    """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'，小时不入表；
+    新格式后缀'10月28日 10:00:00开始' → '10月28日'）。"""
     if not start_time:
         return start_time or '-'
-    return re.sub(r'\s*\d{1,2}:\d{2}(?::\d{2})?$', '', str(start_time).strip()) or str(start_time)
+    s = re.sub(r'(开始|结束)\s*$', '', str(start_time).strip())
+    return re.sub(r'\s*\d{1,2}:\d{2}(?::\d{2})?$', '', s) or s
 
 
-def _parse_block(ws, date_col: int):
+def _parse_views(v) -> int | None:
+    """解析围观人数。兼容：纯数字（旧格式）/ '74人围观' / '1.27w人围观'（2026-10-10 京东新格式，w=万）。
+
+    单价形态（'17797.65元/㎡'）不是围观，返回 None。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip().replace(',', '')
+    if not s:
+        return None
+    if '/㎡' in s or '/平' in s:
+        return None
+    m = re.search(r'(\d+(?:\.\d+)?)\s*([wW万])?', s)
+    if not m:
+        return None
+    num = float(m.group(1))
+    if m.group(2):
+        num *= 10000
+    return int(num)
+
+
+def _looks_like_time(s: str) -> bool:
+    """判断 E 列内容是否为开始时间（而非评估价）：含'月/开始/结束/预计'/时分/年份即判为时间。
+
+    用于区分两种行版式——标准版式（C=起拍/D=评估/E=开始时间）与过渡版式
+    （C=城市面积/D=起拍/E=评估，如'60.45万'无时间特征）。
+    """
+    if not s:
+        return False
+    if '月' in s or '开始' in s or '结束' in s or '预计' in s:
+        return True
+    if re.search(r'\d{1,2}:\d{2}', s):
+        return True
+    if re.search(r'20\d{2}[-/.年]', s):
+        return True
+    return False
+
+
+def _parse_block(ws, date_col: int, sheet_name: str = ''):
     """返回 (提取日期字符串, 数据行列表[(名称, url, 起拍价wan, 评估价wan, 开始时间, 围观人数, 开始日期)]).
 
     取最后一个日期行以下直到表尾的连续数据行；跳过全空行与残缺行。
     开始日期 = parse_start_time(开始时间)，时间无法解析时为 None。
+
+    日期分隔行（2026-10-xx 起京东新格式兼容）：
+    B 列字符串（'2026年10月10日'，旧）或日期列 Excel 序列号（46305=2026-10-10，新），
+    以后出现者为准。
+
+    行版式逐行判定（京东三种历史版式全兼容）：
+    E 列时间特征 → 标准版式（C=起拍/D=评估/E=开始时间/F=围观）；
+    否则 D 列为价格且 F 列为围观 → 过渡版式（D=起拍/E=评估，开始时间记空）。
     """
     last_date_row = None
     last_date = None
@@ -842,20 +918,32 @@ def _parse_block(ws, date_col: int):
     for r in range(last_date_row + 1, ws.max_row + 1):
         name = ws.cell(row=r, column=1).value
         url = ws.cell(row=r, column=2).value
-        start_price = ws.cell(row=r, column=3).value
-        eval_price = ws.cell(row=r, column=4).value
-        start_time = ws.cell(row=r, column=5).value
-        views = ws.cell(row=r, column=6).value
-        if not name or views is None:
-            continue  # 空行 / 残缺行（如京东 3562 行只有网址列）
-        try:
-            views_i = int(views)
-        except (TypeError, ValueError):
+        if not name:
             continue
+        c3 = ws.cell(row=r, column=3).value
+        c4 = ws.cell(row=r, column=4).value
+        c5 = ws.cell(row=r, column=5).value
+        c6 = ws.cell(row=r, column=6).value
+        st_raw = str(c5).strip() if c5 is not None else ''
+        sp3, ep4 = parse_price_to_wan(c3), parse_price_to_wan(c4)
+        if _looks_like_time(st_raw):
+            # 标准版式：C=起拍/D=评估/E=开始时间
+            start_price, eval_price = sp3, ep4
+            start_time = st_raw
+            start_date = parse_start_time(st_raw, default_year=default_year, after=extract_date)
+        elif sp3 is None and ep4 is not None:
+            # 过渡版式：C=城市面积/D=起拍/E=评估，开始时间记空
+            start_price, eval_price = ep4, parse_price_to_wan(c5)
+            start_time, start_date = '', None
+        else:
+            # 标准版式但开始时间缺失（与旧逻辑一致：C=起拍/D=评估/时间记空）
+            start_price, eval_price = sp3, ep4
+            start_time, start_date = '', None
+        views_i = _parse_views(c6)
+        if views_i is None:
+            continue  # 空行 / 残缺行 / 围观无法解析（如'17797.65元/㎡'单价误入围观列）
         items.append((str(name).strip(), str(url).strip() if url else '',
-                      parse_price_to_wan(start_price), parse_price_to_wan(eval_price),
-                      str(start_time).strip() if start_time else '', views_i,
-                      parse_start_time(start_time, default_year=default_year, after=extract_date)))
+                      start_price, eval_price, start_time, views_i, start_date))
     return last_date, items
 
 
@@ -885,7 +973,7 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
             lines.append(f'### {sheet_name}法拍\n\n数据源缺少 sheet「{sheet_name}」。\n')
             continue
         ws = wb[sheet_name]
-        extract_date, items = _parse_block(ws, date_col)
+        extract_date, items = _parse_block(ws, date_col, sheet_name)
         if not items:
             lines.append(f'### {sheet_name}法拍\n\n今日无提取数据。\n')
             continue
@@ -896,25 +984,25 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
         if not future_items:
             lines.append(f'### {sheet_name}法拍\n\n当日 {len(items)} 条物业的拍卖开始时间均不晚于'
                          f'执行当天（{today}）或时间无法解析，无符合「拍卖开始时间晚于执行日」的标的。\n')
-            continue
-        future_items.sort(key=lambda it: it[5], reverse=True)
-        top_items = future_items[:top]
-        lines.append(f'### {sheet_name}法拍（围观 TOP{top}）')
-        lines.append('')
-        lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，剔除已开拍/时间无法解析 '
-                     f'{excluded} 条，按围观人数取前 {top} 条（拍卖开始时间均晚于执行当天 {today}）。')
-        lines.append('')
-        lines.append('| 物业名称 | 当前起拍价(万元) | 评估价(万元) | 折价率(%) | 建筑面积(㎡) | 单价(元/㎡) | 拍卖开始时间 |')
-        lines.append('|---|---|---|---|---|---|---|')
-        for name, url, start_p, eval_p, start_time, _v, _sd in top_items:
-            name_cell = f'[{_clean_name(name)}]({url})' if url else _clean_name(name)
-            discount = None
-            if start_p is not None and eval_p:
-                discount = start_p / eval_p
-            area = extract_area(url) if fetch_area and url else None
-            lines.append(f'| {name_cell} | {fmt_price_wan(start_p)} | {fmt_price_wan(eval_p)} | '
-                         f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {_fmt_start_time(start_time)} |')
-        lines.append('')
+        else:
+            future_items.sort(key=lambda it: it[5], reverse=True)
+            top_items = future_items[:top]
+            lines.append(f'### {sheet_name}法拍（围观 TOP{top}）')
+            lines.append('')
+            lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，剔除已开拍/时间无法解析 '
+                         f'{excluded} 条，按围观人数取前 {top} 条（拍卖开始时间均晚于执行当天 {today}）。')
+            lines.append('')
+            lines.append('| 物业名称 | 当前起拍价(万元) | 评估价(万元) | 折价率(%) | 建筑面积(㎡) | 单价(元/㎡) | 拍卖开始时间 |')
+            lines.append('|---|---|---|---|---|---|---|')
+            for name, url, start_p, eval_p, start_time, _v, _sd in top_items:
+                name_cell = f'[{_clean_name(name)}]({url})' if url else _clean_name(name)
+                discount = None
+                if start_p is not None and eval_p:
+                    discount = start_p / eval_p
+                area = extract_area(url) if fetch_area and url else None
+                lines.append(f'| {name_cell} | {fmt_price_wan(start_p)} | {fmt_price_wan(eval_p)} | '
+                             f'{fmt_discount(discount)} | {fmt_area(area)} | {fmt_unit_price(start_p, area)} | {_fmt_start_time(start_time)} |')
+            lines.append('')
         # 2000万物业汇总（基于当日块全部有效行，不过滤拍卖时间；仅剔除评估价无法解析；合计≥2000万必须以汇总行呈现）
         yi_groups = _group_yi_items(items)
         yi_lines = _render_yi_block(yi_groups, sheet_name, fetch_area=fetch_area)
