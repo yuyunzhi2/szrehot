@@ -226,7 +226,6 @@ def main():
     a = ap.parse_args()
 
     today = datetime.date.fromisoformat(a.date)
-    ws = datetime.date.fromisoformat(a.window_start) if a.window_start else window_start(today)
 
     with open(a.final, encoding='utf-8') as f:
         items = json.load(f)
@@ -249,9 +248,6 @@ def main():
     lines.append(f'**深圳资产日报 · {today.isoformat()}**' if a.mode == 'daily'
                  else f'**深圳资产精选 · {today.isoformat()}**')
     lines.append('')
-    lines.append(f'> 时间窗口：{ws.isoformat()} 00:00 ~ {today.isoformat()} 当前'
-                 + ('（周一执行，窗口起点为上周五，跨周末）' if today.weekday() == 0 else ''))
-    lines.append('')
     # 当日市场情绪指数（必产章节，放在窗口行下方）
     ws_sum = sentiment['weighted_sum']
     ws_str = f'+{ws_sum}' if ws_sum >= 0 else str(ws_sum)
@@ -266,8 +262,6 @@ def main():
     lines.append(f'| 看跌条目 | {sentiment["bearish_count"]}条（权重合计{sentiment["bearish_weight"]}） |')
     lines.append(f'| 加权情绪和 | {ws_str} |')
     lines.append(f'| 总权重 | {sentiment["total_weight"]} |')
-    lines.append('')
-    lines.append(f'> 指数解读：{sentiment["index"]}（{sentiment["label"]}）——{sentiment["phrase"]}。')
     lines.append('')
     for cat, title in CATEGORY_ORDER:
         sec = sections.get(cat) or []
@@ -307,8 +301,6 @@ def main():
     # 大宗租赁关注
     lines.append('## 大宗租赁关注')
     lines.append('')
-    lines.append(f'> 数据来源：深圳阳光租赁平台（rent.szexgrp.com），listingStartDate {ws.isoformat()} ~ {today.isoformat()} 当前')
-    lines.append('')
     summary_paras, table_rows = [], []
     if a.rentals:
         summary_paras, table_rows = extract_rentals_table(a.rentals)
@@ -324,9 +316,6 @@ def main():
     if table_rows:
         lines.extend(table_rows)
         lines.append('')
-        if len(table_rows) > 31:
-            lines.append(f'> 完整清单见 {os.path.basename(a.rentals)}')
-            lines.append('')
 
     md = '\n'.join(lines).rstrip() + '\n'
 

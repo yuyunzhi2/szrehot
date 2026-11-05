@@ -716,6 +716,19 @@ def _clean_name(name) -> str:
     return t if len(t) >= 4 else s
 
 
+try:  # 复用步骤 2 法拍日报的「区 + 小区 + 楼栋房号」口径（2026-11-05 统一）
+    from generate_fapai_daily import clean_name as _fapai_clean_name, promote_er as _fapai_promote_er
+except Exception:  # 依赖缺失时退回本文件的轻量清洗
+    _fapai_clean_name = _fapai_promote_er = None
+
+
+def _display_name(name) -> str:
+    """热点表展示名：与「深圳法拍资产日报」同一套名称精简口径；导入失败退回 _clean_name。"""
+    if _fapai_clean_name is None:
+        return _clean_name(name)
+    return _fapai_promote_er(_fapai_clean_name(str(name or '')))
+
+
 # ---------- 2000万物业归一与汇总（2026-08-31 新增，2026-09-02 起阈值由1亿调整为2000万） ----------
 YI_THRESHOLD_WAN = 2000  # 2000万 = 2000万元（2026-09-02 起由1亿调整）
 _YI_BASE_RE = re.compile(
@@ -783,8 +796,6 @@ def _render_yi_block(groups: list, sheet_name: str, fetch_area: bool = True) -> 
     lines: list[str] = []
     lines.append(f"#### {sheet_name}·评估价超2000万物业（单宗≥2000万 / 同址合计≥2000万）")
     lines.append("")
-    lines.append(f"> 阈值 2000万元（{YI_THRESHOLD_WAN}万元）；归一规则：截断首个栋/座/房/室标识及其后房号，同一基准地址多宗合计≥阈值即入选；合计≥2000万的多宗分组以汇总行呈现，并汇总起拍/评估合计、整体折价率与面积单价；组内拍卖开始日期不同则以日期区间展示。共 {len(groups)} 组。")
-    lines.append("")
     lines.append("| 基准地址 | 宗数 | 起拍价合计(万元) | 评估价合计(万元) | 折价率(%) | 建筑面积合计(㎡) | 单价(元/㎡) | 拍卖开始时间 | 涉及物业明细 |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
     for g in groups:
@@ -794,11 +805,13 @@ def _render_yi_block(groups: list, sheet_name: str, fetch_area: bool = True) -> 
         area_total = 0.0
         n_area = 0
         dates = []
+        base_disp = _display_name(g["base"])
         for member in g["members"]:
             name, url, start_p, eval_p, start_date = member
-            clean = _clean_name(name)
+            clean = _display_name(name)
             base = g["base"]
-            suffix = clean[len(base):].strip(" \uFF0C,\u3001") if clean.startswith(base) else clean
+            base_disp = _display_name(base)
+            suffix = clean[len(base_disp):].strip(" \uFF0C,\u3001") if clean.startswith(base_disp) else clean
             suffix = re.sub(r"的房产\s*$", "", suffix).strip()
             suffix = re.sub(r"房产\s*$", "", suffix).strip()
             if not suffix:
@@ -821,28 +834,34 @@ def _render_yi_block(groups: list, sheet_name: str, fetch_area: bool = True) -> 
         detail_cell = "<br>".join(details)
         if dates:
             lo, hi = min(dates), max(dates)
-            lo_s = f"{lo.month:02d}月{lo.day:02d}日"
-            hi_s = f"{hi.month:02d}月{hi.day:02d}日"
-            time_cell = lo_s if lo == hi else f"{lo_s}-{hi_s}"
+            lo_s = f"{lo.month:02d}-{lo.day:02d}"
+            hi_s = f"{hi.month:02d}-{hi.day:02d}"
+            time_cell = lo_s if lo == hi else f"{lo_s}~{hi_s}"
         else:
             time_cell = "-"
         discount = fmt_discount(start_total / eval_total) if eval_total else "-"
         area_cell = fmt_area(area_total) if n_area else "-"
         unit = fmt_unit_price(start_total, area_total) if n_area else "-"
         lines.append(
-            f"| {g['base']} | {g['count']} | {fmt_price_wan(start_total)} | {fmt_price_wan(eval_total)} | "
+            f"| {base_disp} | {g['count']} | {fmt_price_wan(start_total)} | {fmt_price_wan(eval_total)} | "
             f"{discount} | {area_cell} | {unit} | {time_cell} | {detail_cell} |"
         )
     lines.append("")
     return lines
 
 def _fmt_start_time(start_time: str | None) -> str:
-    """拍卖开始时间仅保留日期部分（'09月28日 10:00' → '09月28日'，小时不入表；
-    新格式后缀'10月28日 10:00:00开始' → '10月28日'）。"""
+    """拍卖开始时间仅保留日期并统一 MM-DD（'09月28日 10:00' → '09-28'；'2026-10-28' → '10-28'）。"""
     if not start_time:
-        return start_time or '-'
+        return '-'
     s = re.sub(r'(开始|结束)\s*$', '', str(start_time).strip())
-    return re.sub(r'\s*\d{1,2}:\d{2}(?::\d{2})?$', '', s) or s
+    s = re.sub(r'\s*\d{1,2}:\d{2}(?::\d{2})?$', '', s).strip()
+    m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日', s)
+    if m:
+        return f'{int(m.group(1)):02d}-{int(m.group(2)):02d}'
+    m = re.search(r'\d{4}[-/.](\d{1,2})[-/.](\d{1,2})', s)
+    if m:
+        return f'{int(m.group(1)):02d}-{int(m.group(2)):02d}'
+    return s or '-'
 
 
 def _parse_views(v) -> int | None:
@@ -940,8 +959,11 @@ def _parse_block(ws, date_col: int, sheet_name: str = ''):
             start_price, eval_price = sp3, ep4
             start_time, start_date = '', None
         views_i = _parse_views(c6)
-        if views_i is None:
-            continue  # 空行 / 残缺行 / 围观无法解析（如'17797.65元/㎡'单价误入围观列）
+        # 围观人数无法解析 ≠ 丢弃：有价格的有效房源保留（围观计 None），
+        # 供 render_section 在按围观取 TOP 不足 top 条时按单价降序补足（2026-11-03 新增）。
+        # 仅当价格也无法解析时才视为空行/残缺行跳过。
+        if views_i is None and start_price is None and eval_price is None:
+            continue
         items.append((str(name).strip(), str(url).strip() if url else '',
                       start_price, eval_price, start_time, views_i, start_date))
     return last_date, items
@@ -952,8 +974,8 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
     """渲染「今日法拍资产热点」章节 md。xlsx 缺失/无日期行时返回说明文字（不抛错）。
 
     拍卖开始时间审核（2026-08-19 新增，硬性门槛）：仅保留拍卖开始时间**严格晚于执行当天**
-    的物业进入 TOP5——开始日期 ≤ 当天（已开拍/已结束）或时间无法解析者一律剔除，
-    在说明行中计数「剔除 X 条」。无符合条件条目时输出说明文字，不降级放宽。
+    的物业进入 TOP5——开始日期 ≤ 当天（已开拍/已结束）或时间无法解析者一律剔除
+    （2026-11-05 起 md 不再输出计数说明行）。无符合条件条目时仅输出简短状态提示，不降级放宽。
 
     fetch_area=True 时打开 TOP5 详情页提取建筑面积并计算单价（京东走 API，阿里直连，
     被反爬拦截的面积/单价显示 '-'）；False 时两列均为 '-'（--no-fetch）。
@@ -973,29 +995,42 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
             lines.append(f'### {sheet_name}法拍\n\n数据源缺少 sheet「{sheet_name}」。\n')
             continue
         ws = wb[sheet_name]
-        extract_date, items = _parse_block(ws, date_col, sheet_name)
+        _extract_date, items = _parse_block(ws, date_col, sheet_name)
         if not items:
             lines.append(f'### {sheet_name}法拍\n\n今日无提取数据。\n')
             continue
         any_data = True
         # 拍卖开始时间审核（硬性门槛）：仅保留开始日期严格晚于执行当天（today）的物业
         future_items = [it for it in items if it[6] is not None and it[6] > today]
-        excluded = len(items) - len(future_items)
         if not future_items:
-            lines.append(f'### {sheet_name}法拍\n\n当日 {len(items)} 条物业的拍卖开始时间均不晚于'
-                         f'执行当天（{today}）或时间无法解析，无符合「拍卖开始时间晚于执行日」的标的。\n')
+            lines.append(f'### {sheet_name}法拍\n\n无符合「拍卖开始时间晚于执行日」的标的。\n')
         else:
-            future_items.sort(key=lambda it: it[5], reverse=True)
-            top_items = future_items[:top]
+            # TOP 名额分配（2026-11-03 优化）：
+            #   1) 有围观人数者按围观降序排（主热度源）；
+            #   2) 围观缺失者一律按单价（起拍价÷面积）降序；
+            #   两者合并取前 top 条 —— 即「围观不足 top 个时，由单价高者补足」。
+            def _unit_sort_key(it):
+                _sp, _url = it[2], it[1]
+                if fetch_area and _url:
+                    _ar = extract_area(_url)  # 缓存/当次 _AREA_MISS 命中零开页
+                else:
+                    _ar = None
+                if _sp is None or _ar is None or _ar <= 0:
+                    return (1, 0.0)  # 无单价排最后
+                return (0, -(_sp * 10000 / _ar))  # 单价降序
+
+            with_views = [it for it in future_items if it[5] is not None]
+            with_views.sort(key=lambda it: it[5], reverse=True)
+            without_views = [it for it in future_items if it[5] is None]
+            without_views.sort(key=_unit_sort_key)
+            top_items = (with_views + without_views)[:top]
+            # 说明：总数为 with_views + without_views 两条序列的并集，长度为 future_items 长度。
             lines.append(f'### {sheet_name}法拍（围观 TOP{top}）')
-            lines.append('')
-            lines.append(f'> 提取日期：{extract_date}；当日共 {len(items)} 条，剔除已开拍/时间无法解析 '
-                         f'{excluded} 条，按围观人数取前 {top} 条（拍卖开始时间均晚于执行当天 {today}）。')
             lines.append('')
             lines.append('| 物业名称 | 当前起拍价(万元) | 评估价(万元) | 折价率(%) | 建筑面积(㎡) | 单价(元/㎡) | 拍卖开始时间 |')
             lines.append('|---|---|---|---|---|---|---|')
             for name, url, start_p, eval_p, start_time, _v, _sd in top_items:
-                name_cell = f'[{_clean_name(name)}]({url})' if url else _clean_name(name)
+                name_cell = f'[{_display_name(name)}]({url})' if url else _display_name(name)
                 discount = None
                 if start_p is not None and eval_p:
                     discount = start_p / eval_p
@@ -1008,11 +1043,6 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
         yi_lines = _render_yi_block(yi_groups, sheet_name, fetch_area=fetch_area)
         if yi_lines:
             lines.extend(yi_lines)
-        else:
-            eval_valid = sum(1 for _n,_u,_sp,ep,_st,_v,_sd in items if ep is not None)
-            if eval_valid:
-                lines.append(f'> {sheet_name}当日 {eval_valid} 宗评估价可解析物业中，无单宗或同址合计评估价≥2000万元的标的。')
-                lines.append('')
     if not any_data:
         lines.append('今日无法拍资产热点数据。')
         lines.append('')
