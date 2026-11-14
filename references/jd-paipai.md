@@ -23,6 +23,8 @@ python -X utf8 scripts/jd_paipai/fetch_closed.py [--since YYYY-MM-DD] [--dry-run
   `run_daily_chain.py` 会把 `--since/--until` 随业务日期滚动，指定往日也一致。
 - 详情补全带 `scripts/jd_paipai/_jd_cache.json` 断点续跑缓存；向 stdout 只写交付行，日志走 stderr。
 
+**下游消费（2026-11-14 起）**：步骤 2 法拍日报与步骤 3 法拍热点章节都会读这两个 API sheet 的**当日块**，与人工 `京东`/`京东成交` 当日块取并集。因此当日块是「当天新增」而不是全量在售快照——消费方按「新增」语义使用，不能把它当在售清单去点当日总量。
+
 ## 块格式（硬约束）
 
 1. 取 sheet **首个可用行**（空表 A1 为空则行 1，否则 `max_row+1`），A 列写运行当天日期（`2026年10月09日`）。
