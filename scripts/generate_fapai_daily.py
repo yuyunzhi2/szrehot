@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """深圳法拍资产日报生成器
 
-从 法拍数据.xlsx 的 京东 / 阿里 / 京东成交 / 阿里成交 四个工作表中，
-按日期块提取当日数据，输出 markdown 日报。
+从 法拍数据.xlsx 的 京东 / 阿里 / 京东成交 / 阿里成交 四个工作表，
+按**业务日当日日期块**提取数据，输出 markdown 日报；京东两表另与步骤 1 的
+`京东API` / `京东成交API` 当日块取**并集**（同名去二拍/变卖前缀 + 价格差 ≤0.05 万
+判同，数值/热度取 API、名称保处置标记）。详见 references/fapai-daily.md。
 
 日期标记兼容三种形态：
   1) 中文文本 "2026年10月27日"（允许首尾空白）
   2) ISO 文本 "2026-10-27" / "2026/10/27" / "2026.10.27"
   3) Excel 日期序列值（如 46322）或 datetime/date 对象
+标记行按「SHEETS 声明列 + 前 3 列」探测（2026-11-14 起）：人工表会把日期粘到
+别的列（阿里 2026-11-05 起写进 B 列），只认单列会整块漏掉并静默回退。
 
 呈现规则：
   - 拍卖开始时间只保留到日期（如 "11月23日 10:00:00开始" -> "11月23日"）
@@ -17,10 +21,11 @@
   - 含"二拍"的名称把"二拍"提到首位，全部二拍项独立成组置顶，组内按
     "二拍"后的城区名称首字拼音降序；其余项按城区降序；无城区的行排
     组内最后并保持原序。
-  - 入选规则：
-      关注（新增关注top10）：当前价与评估价均有数据，按热度降序取前 10
-      成交（成交top10）：当前价与评估价均有数据；折价率 > 100% 的一律
-        入选，其余按折价率由低到高补足至 10 条
+  - 入选规则（2026-11-03 起）：
+      关注（新增关注top10）：有当前价即入选；有围观按围观降序，围观无法解析
+        按当前价降序补足至 10 条（评估价缺失时折价率显示「—」）
+      成交（成交top10）：有成交价即入选；折价率 > 100% 的一律入选，其余按
+        折价率由低到高补足至 10 条，评估价缺失者排最后
 
 用法（工作目录 = szrehot 技能目录）：
   python -X utf8 scripts/generate_fapai_daily.py                    # 今天，缺省路径
@@ -56,15 +61,16 @@ except ImportError:
 DEFAULT_XLSX = r"D:\Desktop\法拍数据.xlsx"
 DEFAULT_OUT_DIR = r"D:\Administrator\Documents\大瑀MD"
 
-# 表配置：(sheet 名, 日期列 0-based, 模式)
+# 表配置：(sheet 名, 日期列, 模式, API 并集源 (sheet 名, 日期列) 或 None)
 #   watch = 新增关注：按 F 列热度降序取前 10
 #   deal_jd = 京东成交：F 列含"出价"字样
 #   deal_ali = 阿里成交：F 列出价人数 > 0
+# 第四项为并集源：人工表 ∪ 步骤 1（jd_paipai）归档的 API 块，按清洗名+价格去重合并。
 SHEETS = [
-    ("阿里", 0, "watch"),
-    ("京东", 1, "watch"),
-    ("阿里成交", 0, "deal_ali"),
-    ("京东成交", 1, "deal_jd"),
+    ("阿里", 0, "watch", None),
+    ("京东", 1, "watch", ("京东API", 0)),
+    ("阿里成交", 0, "deal_ali", None),
+    ("京东成交", 1, "deal_jd", ("京东成交API", 0)),
 ]
 
 TITLE_MAP = {
@@ -215,6 +221,40 @@ def is_marker(row, date_col):
         if isinstance(cell, str) and cell.strip().lower().startswith(("http://", "https://")):
             return None
     return d
+
+
+# 日期标记行的列漂移容错：阿里 sheet 自 2026-11-05 起日期写进了 B 列（A 列空），
+# 只认单一 date_col 会把当天块漏掉并静默回退到十几天前的块。改为「首选列 + 前 3 列」
+# 依次探测；非空格数 ≤2 是因为部分老块把日期在 A、B 各写了一遍。
+DATE_COL_PROBE = (0, 1, 2)
+MARKER_MAX_CELLS = 2
+
+
+def _non_empty_cells(row):
+    return [c for c in row if c is not None and str(c).strip() not in ("", "-", "—")]
+
+
+def _has_url(row):
+    return any(isinstance(c, str) and c.strip().lower().startswith(("http://", "https://"))
+               for c in row)
+
+
+def find_markers(rows, preferred=None):
+    """全部日期标记行 -> [(row_idx_0based, date)]；preferred 为首选日期列"""
+    cols = ([preferred] if preferred is not None else []) + \
+           [c for c in DATE_COL_PROBE if c != preferred]
+    markers = []
+    for i, r in enumerate(rows):
+        if not r or _has_url(r) or len(_non_empty_cells(r)) > MARKER_MAX_CELLS:
+            continue
+        for c in cols:
+            if c >= len(r):
+                continue
+            d = parse_date_cell(r[c])
+            if d is not None:
+                markers.append((i, d))
+                break
+    return markers
 
 
 def is_data_row(row):
@@ -675,12 +715,9 @@ def md_cell(s):
 
 def extract_block(rows, date_col, target):
     """定位 target 日期块；当天无有效块则回退到最新的有效块。
+    date_col 为首选日期列，列漂移时按 find_markers 自动探测。
     返回 (data_rows, used_date, fallback: bool, block_size: int)"""
-    markers = []  # (row_idx_0based, date)
-    for i, r in enumerate(rows):
-        d = is_marker(r, date_col)
-        if d is not None:
-            markers.append((i, d))
+    markers = find_markers(rows, date_col)
     if not markers:
         return [], None, False, 0
 
@@ -701,17 +738,38 @@ def extract_block(rows, date_col, target):
     return body, d, True, len(body)
 
 
-def make_item(r):
-    """行 -> 输出项（含清洗名、二拍标记、城区与拼音键）"""
-    cur = parse_price_wan(r[2]) if len(r) > 2 else None
-    ev = parse_price_wan(r[3]) if len(r) > 3 else None
-    start = fmt_start(r[4]) if len(r) > 4 else "—"
-    name = promote_er(clean_name(str(r[0])))
+def _zero_none(v):
+    """评估价/当前价 0 视为缺失（API 用 0 表示无评估价，不能显示成「评估价 0」）"""
+    if v is None or v <= 0:
+        return None
+    return v
+
+
+def _new_item(name, cur, ev, start):
+    """清洗后的名称 + 价格 + 开始时间 -> 输出项（含二拍标记、城区与拼音键）"""
     is_er = "二拍" in name
     loc = extract_locality(name)
-    return {"name": md_cell(name), "cur": cur, "ev": ev,
+    return {"name": md_cell(name), "plain": name, "cur": cur, "ev": ev,
             "start": md_cell(start), "loc": loc, "py": locality_pinyin(loc),
             "is_er": is_er}
+
+
+def make_item(r):
+    """人工表 6 列行 -> 输出项（A 名称｜B 网址｜C 当前价｜D 评估价｜E 开始时间｜F 热度）"""
+    cur = _zero_none(parse_price_wan(r[2])) if len(r) > 2 else None
+    ev = _zero_none(parse_price_wan(r[3])) if len(r) > 3 else None
+    start = fmt_start(r[4]) if len(r) > 4 else "—"
+    name = promote_er(clean_name(str(r[0])))
+    return _new_item(name, cur, ev, start)
+
+
+def make_item_api(r):
+    """API 16 列行 -> 输出项（C 物业名称｜E 起拍｜F 当前价｜G 评估价｜M 开始时间）"""
+    cur = _zero_none(parse_price_wan(r[5])) if len(r) > 5 else None
+    ev = _zero_none(parse_price_wan(r[6])) if len(r) > 6 else None
+    start = fmt_start(r[12]) if len(r) > 12 else "—"
+    name = promote_er(clean_name(str(r[2]) if len(r) > 2 else ""))
+    return _new_item(name, cur, ev, start)
 
 
 def has_prices(it):
@@ -726,61 +784,167 @@ def ratio_of(it):
     return it["cur"] / it["ev"]
 
 
-def build_watch_rows(body):
-    """新增关注表（2026-11-03 容错）：TOP 名额分两层——有围观人数者按围观降序
-    （主热度源）；围观无法解析（缺失/被单价等噪声占据）的行不再整条丢弃，改为
-    按**当前价降序**补足 TOP 名额（数据行无面积字段，脚本不开详情页，用当前价作
-    为单价近似的排序键）。两者合并取前 TOP_N。
-    """
+# ---------- 多源并集（2026-11-14：人工表 ∪ 步骤 1 的 API 归档） ----------
+# 人工表有 API 抓不到的标的（如 2026-11-14 实测 4 条阳光新境园在 京东API 全表 0 命中），
+# API 表有 100% 可解析的围观数且不漏人工漏抄的行；两者按「清洗名去处置标记 + 价格」
+# 去重后合并，数值以 API 为准，名称取带处置标记的一方。
+
+MARK_RE = re.compile(r"^(?:二拍|变卖|拍卖)+")
+MERGE_PRICE_TOL = 0.05          # 万元；人工表与 API 表存在 0.01 级取整差
+NO_DATE_START = ("—", "进行中", "预告中", "已结束", "")
+# 京东成交API 的块是「--since 窗口内且历史未出现」的增量，可能夹带多日前的旧成交
+# （2026-11-14 实测夹带 11-05 怡景花园 2093 万）。人工表的口径是「业务日前一天的成交」，
+# 周末/断档最多滞后 2 天，故 API 成交行按「距业务日 ≤3 天」过滤。
+API_DEAL_MAX_LAG_DAYS = 3
+
+
+def _same_property(a, b):
+    """同名（去处置标记）+ 价格差 ≤0.05 万 → 同一物业（人工表与 API 表存在 149.87/149.88 这类取整差）"""
+    if MARK_RE.sub("", a["plain"]) != MARK_RE.sub("", b["plain"]):
+        return False
+    if a["cur"] is None or b["cur"] is None:
+        return True
+    return abs(a["cur"] - b["cur"]) <= MERGE_PRICE_TOL
+
+
+def _retag(it, name):
+    it = dict(it)
+    it["plain"] = name
+    it["name"] = md_cell(name)
+    it["is_er"] = "二拍" in name
+    it["loc"] = extract_locality(name)
+    it["py"] = locality_pinyin(it["loc"])
+    return it
+
+
+def _merge_pair(old, new):
+    """old=先到的源（人工），new=后到的源（API）：数值取 new，名称取带处置标记的一方"""
+    name = old["plain"]
+    if MARK_RE.search(new["plain"]) and not MARK_RE.search(name):
+        name = new["plain"]
+    elif old["loc"] is None and new["loc"] is not None:
+        name = new["plain"]
+    it = _retag(old, name)
+    if new["cur"] is not None:
+        it["cur"] = new["cur"]
+    if new["ev"] is not None:
+        it["ev"] = new["ev"]
+    if new["start"] not in NO_DATE_START and it["start"] in NO_DATE_START:
+        it["start"] = new["start"]
+    if new.get("heat") is not None:
+        it["heat"] = new["heat"]
+    return it
+
+
+def merge_items(*groups):
+    """多源合并：保留首次出现顺序，后到源的数值覆盖先到源"""
+    merged = []
+    for items in groups:
+        for it in items:
+            hit = next((i for i, m in enumerate(merged) if _same_property(m, it)), None)
+            if hit is None:
+                merged.append(dict(it))
+            else:
+                merged[hit] = _merge_pair(merged[hit], it)
+    return merged
+
+
+def _end_date(v):
+    """API 结束时间 '2026-11-13 11:26' -> date | None"""
+    m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", str(v or ""))
+    if not m:
+        return None
+    try:
+        return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _deal_in_window(r, target):
+    """API 成交行时效：结束时间距业务日 ≤ API_DEAL_MAX_LAG_DAYS 天（且不晚于业务日）"""
+    d = _end_date(r[13] if len(r) > 13 else None)
+    if d is None or target is None:
+        return True                      # 时间缺失不擅自丢弃，交由入选规则决定
+    lag = (target - d).days
+    return 0 <= lag <= API_DEAL_MAX_LAG_DAYS
+
+
+def collect_watch(body, api=False):
+    """新增关注候选：有当前价即入选（不编数）；热度取人工 F 列或 API 围观数"""
     items = []
     for r in body:
-        heat = parse_heat(r[5]) if len(r) > 5 else None
-        it = make_item(r)
+        if api:
+            heat = r[11] if len(r) > 11 else None
+            if not isinstance(heat, (int, float)) or isinstance(heat, bool):
+                heat = None
+            it = make_item_api(r)
+        else:
+            heat = parse_heat(r[5]) if len(r) > 5 else None
+            it = make_item(r)
         if it["cur"] is None:
-            continue  # 无当前价不入选（不编数）
+            continue
         it["heat"] = heat
         items.append(it)
-    # 有围观按围观降序；围观不可解析按当前价降序；合并取前 TOP_N
-    with_heat = [x for x in items if x["heat"] is not None]
-    with_heat.sort(key=lambda x: x["heat"], reverse=True)
-    without_heat = [x for x in items if x["heat"] is None]
-    without_heat.sort(key=lambda x: x["cur"] if x["cur"] is not None else 0, reverse=True)
-    picked = (with_heat + without_heat)[:TOP_N]
-    return sort_by_locality(picked), len(items)
+    return items
 
 
-def build_deal_rows(body, mode):
-    """成交表：京东按 F 含'出价'；阿里按 F 出价人数>0。
-
-    入选（2026-11-03 放宽）：仅要求**成交价（当前价）有数据**即可入选——评估价缺失
-    的成交记录不再整条丢弃，折价率如实显示「—」（不编造评估价）。
-    折价率可算（评估价齐全）的项：>100% 必选，其余按折价率由低到高补足；
-    评估价缺失（折价率不可算）的项排最后，仅在名额未满时纳入。
-    """
+def collect_deal(body, mode, api=False, target=None):
+    """成交候选：人工表按 F 列（京东含「出价」/阿里出价人数>0），API 按出价次数>0 + 时效窗口"""
     items = []
     for r in body:
-        f = r[5] if len(r) > 5 else None
-        if mode == "deal_jd":
-            if not (isinstance(f, str) and "出价" in f):
-                continue  # 忽略 'X人围观' 等
-        else:  # deal_ali
-            n = parse_heat(f)
-            if n is None or n == 0:
-                continue  # 忽略 0 与噪声
-        it = make_item(r)
+        if api:
+            bids = r[10] if len(r) > 10 else None
+            if not (isinstance(bids, (int, float)) and not isinstance(bids, bool) and bids > 0):
+                continue                     # 出价 0 = 流拍，不算成交
+            if not _deal_in_window(r, target):
+                continue
+            it = make_item_api(r)
+        else:
+            f = r[5] if len(r) > 5 else None
+            if mode == "deal_jd":
+                if not (isinstance(f, str) and "出价" in f):
+                    continue                 # 忽略 'X人围观' 等（流拍）
+            else:  # deal_ali
+                n = parse_heat(f)
+                if n is None or n == 0:
+                    continue
+            it = make_item(r)
         if it["cur"] is None:
-            continue  # 无成交价（当前价）不入选（不编数）
-        it["ratio"] = ratio_of(it)  # 评估价缺失时 None → 折价率「—」
+            continue
         items.append(it)
+    return items
 
-    # 折价率 > 100% 必选；其余（含折价率可算者）按折价率由低到高；
-    # 评估价缺失（ratio=None）的项排最后，仅名额未满时纳入。
+
+def select_watch(items):
+    """TOP 名额分两层：有围观按围观降序，围观不可解析按当前价降序补足（2026-11-03 容错）"""
+    with_heat = sorted([x for x in items if x.get("heat") is not None],
+                       key=lambda x: x["heat"], reverse=True)
+    without_heat = [x for x in items if x.get("heat") is None]
+    without_heat.sort(key=lambda x: x["cur"] if x["cur"] is not None else 0, reverse=True)
+    return (with_heat + without_heat)[:TOP_N]
+
+
+def select_deal(items):
+    """折价率 > 100% 必选；其余按折价率由低到高；评估价缺失排最后补足（2026-11-03 放宽）"""
+    for it in items:
+        it["ratio"] = ratio_of(it)
     hot = [it for it in items if it["ratio"] is not None and it["ratio"] > 1.0]
     rest_with_ratio = sorted([it for it in items if it["ratio"] is not None and it["ratio"] <= 1.0],
                              key=lambda x: x["ratio"])
     rest_no_ratio = [it for it in items if it["ratio"] is None]
-    picked = (hot + rest_with_ratio + rest_no_ratio)[:TOP_N]
-    return sort_by_locality(picked), len(items)
+    return (hot + rest_with_ratio + rest_no_ratio)[:TOP_N]
+
+
+def build_watch_rows(body):
+    """单源（人工表）新增关注 -> (rows, 候选数)，保留给 --audit 与回归用"""
+    items = collect_watch(body)
+    return sort_by_locality(select_watch(items)), len(items)
+
+
+def build_deal_rows(body, mode):
+    """单源（人工表）成交 -> (rows, 候选数)"""
+    items = collect_deal(body, mode)
+    return sort_by_locality(select_deal(items)), len(items)
 
 
 # ---------- 输出 ----------
@@ -893,7 +1057,7 @@ def audit_names(xlsx_path, out_tsv=None):
     """--audit-names：全量导出 原名 → 新名 并统计精简率/回退率/残留地址词"""
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     names = []
-    for sheet, _, _ in SHEETS:
+    for sheet, *_ in SHEETS:
         if sheet not in wb.sheetnames:
             continue
         for r in wb[sheet].iter_rows(values_only=True):
@@ -965,7 +1129,7 @@ def main():
     wb = load_workbook(xlsx, read_only=True, data_only=True)
     results = {}   # sheet -> dict
     order = []
-    for name, date_col, mode in SHEETS:
+    for name, date_col, mode, api_src in SHEETS:
         if name not in wb.sheetnames:
             print(f"[{name}] 工作表不存在，跳过")
             results[name] = {"items": [], "used": None, "fallback": False, "valid": 0, "block": 0, "mode": mode}
@@ -973,24 +1137,65 @@ def main():
             continue
         rows = list(wb[name].iter_rows(values_only=True))
         body, used, fallback, block_size = extract_block(rows, date_col, target)
+
+        api_body, api_used, api_block = [], None, 0
+        if api_src:
+            api_name, api_col = api_src
+            if api_name in wb.sheetnames:
+                api_rows = list(wb[api_name].iter_rows(values_only=True))
+                api_body, api_used, _, api_block = extract_block(api_rows, api_col, target)
+                if api_used != target:
+                    api_body, api_block = [], 0   # 只并当日块；否则会把他日数据混进当日表
+            else:
+                print(f"[{name}] 并集源「{api_name}」不存在，仅用人工块")
+
+        if not (used == target) and api_used == target:
+            # 人工块是他日数据（当日没人工录入），只并入当日 API 块，避免两天混表
+            body, block_size = [], 0
+            print(f"[{name}] 提示：人工表当日无块（{used}），仅用 API 块出表",
+                  file=sys.stderr)
+
         if mode == "watch":
-            items, valid = build_watch_rows(body)
+            cands = merge_items(collect_watch(body),
+                                collect_watch(api_body, api=True))
+            items = sort_by_locality(select_watch(cands))
         else:
-            items, valid = build_deal_rows(body, mode)
-        results[name] = {"items": items, "used": used, "fallback": fallback,
-                         "valid": valid, "block": block_size, "mode": mode}
-        tag = "回退" if fallback else "当日"
-        print(f"[{name}] {tag} 数据日期={used} 块内行数={block_size} 候选行={valid} 入选={len(items)}")
+            cands = merge_items(collect_deal(body, mode),
+                                collect_deal(api_body, "deal_jd", api=True, target=target))
+            items = sort_by_locality(select_deal(cands))
+
+        dates = [d for d in (used, api_used) if d]
+        eff_used = target if target in dates else (max(dates) if dates else None)
+        eff_fallback = bool(dates) and eff_used != target
+        block = block_size + api_block
+        results[name] = {"items": items, "used": eff_used, "fallback": eff_fallback,
+                         "valid": len(cands), "block": block, "mode": mode,
+                         "api_used": api_used, "api_block": api_block}
+        tag = "回退" if eff_fallback else "当日"
+        detail = f"块内行数={block_size}" + (f"+{api_block}(API)" if api_src else "")
+        print(f"[{name}] {tag} 数据日期={eff_used} {detail} "
+              f"候选行={len(cands)} 入选={len(items)}")
+        if api_src and api_used != target:
+            print(f"[{name}] 提示：API 源「{api_src[0]}」当日无块（{api_used}），"
+                  f"仅人工块出表", file=sys.stderr)
         order.append(name)
     wb.close()
 
     # 组装 markdown（2026-11-05：去掉概览/数据日期/脚注等注释，表前统一放滑动提示）
+    # 2026-11-14：回退块必须在正文可见，否则标题日期与数据日期不符而读者无从察觉
     out_lines = [f"# 深圳法拍资产日报（{target.isoformat()}）", ""]
+    warnings = []
 
     for name in order:
         r = results[name]
         out_lines.append(f"## {TITLE_MAP[name]}")
         out_lines.append("")
+        if r["fallback"] and r["used"]:
+            out_lines.append(f"> ⚠️ 数据日期：{r['used'].isoformat()}"
+                             f"（{target.isoformat()} 当日无有效块，已回退）")
+            out_lines.append("")
+            warnings.append(f"{name} 当日无有效块，回退至 {r['used'].isoformat()}"
+                            f"（块内 {r['block']} 行）")
         out_lines.append(SLIDE_HINT)
         out_lines.append("")
         if not r["items"]:
@@ -1010,7 +1215,13 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(out_lines), encoding="utf-8")
     print(f"已生成：{out_path}")
+    if warnings:
+        for w in warnings:
+            sys.stderr.write(f"[回退] {w}\n")
+        sys.stderr.write("存在非当日数据块，日报已标注；请核对 xlsx 当日块后重跑\n")
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

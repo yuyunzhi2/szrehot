@@ -4,12 +4,17 @@
 数据源（固定路径）：D:\\Desktop\\法拍数据.xlsx
   - sheet「京东」：前6列 = 物业名称 / 法拍详情网址 / 当前起拍价 / 评估价 / 拍卖开始时间 / 围观人数（热度）
     提取日期位于**第2列**；该日期行以下的数据行为当日提取的数据
-  - sheet「阿里」：前6列同上；提取日期位于**第1列**；该日期行以下的数据行为当日提取的数据
+  - sheet「阿里」：前6列同上；提取日期位于**第1列**（2026-11-05 起人工粘到第2列，2026-11-14 起
+    按「声明列 + 前3列」自动探测，勿只认固定列）
+  - sheet「京东API」：步骤 1 的自动归档（16 列），与「京东」当日块取**并集**
   - sheet「中拍」：不在本需求范围内，忽略
 
 规则：
-  - 每个 sheet 取**最后一个日期行**以下（到表尾）的连续数据行 = 当日提取数据
-  - 过滤无物业名称 / 无围观人数的垃圾行（含日期块内偶发的残缺行）
+  - **取业务日（--today）当日块**；当日无块才回退到最新非空块，且在正文标注
+    `> ⚠️ 数据日期：…（当日无有效块，已回退）`（2026-11-14 起，禁止静默用旧块）
+  - 京东 = 人工「京东」当日块 ∪「京东API」当日块：同名（去二拍/变卖前缀）+ 起拍价差 ≤0.05 万
+    视为同一物业，名称保处置标记，围观/价格取 API（人工表 F 列常被单价占据）
+  - 过滤无物业名称 / 无价格无围观人数的垃圾行（含日期块内偶发的残缺行）
   - 按围观人数降序取 TOP5（默认 5 条，--top 可调）
   - 拍卖开始时间审核（2026-08-19 新增，硬性门槛）：TOP5 的「拍卖开始时间」必须严格晚于
     技能执行当天日期（开始日期 > 执行日）；已开拍（开始日期 ≤ 执行日）或时间无法解析的
@@ -47,8 +52,18 @@ except ImportError:  # noqa: BLE001 — 无 requests 时降级为不抓面积
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 DEFAULT_XLSX = r'D:\Desktop\法拍数据.xlsx'
-# (sheet名, 日期所在列) — 列号从 1 起
-SHEETS = [('京东', 2), ('阿里', 1)]
+# (sheet名, 日期所在列, API 并集源或 None) — 列号从 1 起；日期列仅为首选，实际按前 3 列探测
+SHEETS = [('京东', 2, '京东API'), ('阿里', 1, None)]
+
+# 日期行探测：人工表会把日期粘到别的列（阿里 2026-11-05 起写进 B 列、A 列空），
+# 只认单一列会让整块漏掉 → 与 generate_fapai_daily.find_markers 同口径。
+DATE_COL_PROBE = (1, 2, 3)
+MAX_MARKER_CELLS = 2
+
+# 京东API 块列（1 起）：C 物业名称｜E 起拍价｜G 评估价｜L 围观数｜M 拍卖开始时间｜P 详情链接
+API_NAME, API_URL, API_START_P, API_EVAL_P, API_VIEWS, API_START_T = 3, 16, 5, 7, 12, 13
+API_MERGE_TOL = 0.05     # 万元；人工表与 API 表存在 0.01 级取整差
+MARK_PREFIX_RE = re.compile(r'^(?:二拍|变卖|拍卖)+')
 
 
 def _is_date_serial(v) -> bool:
@@ -86,6 +101,51 @@ def _date_str(v) -> str:
     if _is_date_serial(v):
         return _serial_to_str(v)
     return str(v).strip()
+
+
+def _date_of(v) -> datetime.date | None:
+    """日期单元格 -> date（datetime/date、Excel 序列号、'2026年11月14日'/'2026-11-14'）"""
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, datetime.date):
+        return v
+    if _is_date_serial(v):
+        return datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v))
+    if isinstance(v, str):
+        return parse_start_time(v)
+    return None
+
+
+def _date_markers(ws, preferred: int) -> list[tuple[int, datetime.date]]:
+    """全部日期行 -> [(row, date)]，按「首选列 + 前 3 列」探测。
+
+    人工表会粘错列（阿里 2026-11-05 起日期写进 B 列、A 列空），只认首选列会把整块漏掉；
+    判定附加条件：整行无 URL、非空单元格 ≤2（部分老块把日期在 A、B 各写一遍）。
+    """
+    cols = [preferred] + [c for c in DATE_COL_PROBE if c != preferred]
+    last_col = min(ws.max_column or 1, API_URL)
+    markers = []
+    for r in range(1, (ws.max_row or 1) + 1):
+        vals = [ws.cell(row=r, column=c).value for c in range(1, last_col + 1)]
+        nz = [v for v in vals if v is not None and str(v).strip() not in ('', '-', '—')]
+        if len(nz) > MAX_MARKER_CELLS:
+            continue
+        if any(isinstance(v, str) and v.strip().lower().startswith(('http://', 'https://'))
+               for v in vals):
+            continue
+        for c in cols:
+            d = _date_of(ws.cell(row=r, column=c).value)
+            if d is not None:
+                markers.append((r, d))
+                break
+    return markers
+
+
+def _iter_blocks(ws, markers):
+    """(起始日期行, 结束行(不含), 日期) 序列"""
+    for k, (start, d) in enumerate(markers):
+        end = markers[k + 1][0] if k + 1 < len(markers) else (ws.max_row or 1) + 1
+        yield start, end, d
 
 
 def parse_start_time(v, default_year: int | None = None,
@@ -256,15 +316,25 @@ _load_area_store()
 _AREA_RE = re.compile(r'(?<!占地)(?<!宗地)(?<!使用)(?<!计租)(?<!投影)(?<!公摊)(?<!套内)(?<!分摊)(?:建筑面积|测绘面积|面积)[^0-9，。,]{0,6}?([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 # 多栋合计写法：产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡（取合计 C）
 _AREA_RE_TOTAL = re.compile(r'共\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
+# 权属证载明口径（最高优先级）：京东公告正文「证载建筑面积为X平方米」「拍卖物建筑面积为：X平方米」
+# （2026-11-12 实测：鑫园广场商铺105/106 页面首现「承租面积合计为599.42平方米」，
+#  裸「面积」分支误取租约面积，正确值在后文「证载建筑面积为50.50平方米」）
+_AREA_RE_CERT = re.compile(r'(?:证载建筑面积|拍卖物建筑面积)\s*(?:为|是)?\s*[：:]?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:平方米|㎡)')
 
 
 def _extract_area_text(text: str) -> float | None:
     """从清洗后文本提取建筑面积。优先标准「建筑面积 X 平方米/㎡」；
     多栋合计写法（产权证载明建筑面积 2栋A㎡、3栋B㎡.共C㎡）取合计 C。"""
+    m = _AREA_RE_CERT.search(text)
+    if m:
+        return float(m.group(1))
     for m in _AREA_RE.finditer(text):
         # 口径 guard：「套内建筑面积」中的裸「面积」分支会绕过定长后顾，
-        # 统一检查匹配点前 4 字是否含排除前缀（含套内/公摊/使用/占地等）
-        if any(k in text[max(0, m.start() - 4):m.start()] for k in ('套内', '公摊', '使用', '占地', '宗地', '计租', '投影', '分摊')):
+        # 统一检查匹配点前 6 字是否含排除前缀（含套内/公摊/使用/占地等），
+        # 承租/租赁/租约/合计/土地 亦排除（租约面积 ≠ 产权面积）
+        if any(k in text[max(0, m.start() - 6):m.start()]
+               for k in ('套内', '公摊', '使用', '占地', '宗地', '计租', '投影', '分摊',
+                         '承租', '租赁', '租约', '合计', '土地')):
             continue
         return float(m.group(1))
     if '建筑面积' not in text:
@@ -904,37 +974,16 @@ def _looks_like_time(s: str) -> bool:
     return False
 
 
-def _parse_block(ws, date_col: int, sheet_name: str = ''):
-    """返回 (提取日期字符串, 数据行列表[(名称, url, 起拍价wan, 评估价wan, 开始时间, 围观人数, 开始日期)]).
-
-    取最后一个日期行以下直到表尾的连续数据行；跳过全空行与残缺行。
-    开始日期 = parse_start_time(开始时间)，时间无法解析时为 None。
-
-    日期分隔行（2026-10-xx 起京东新格式兼容）：
-    B 列字符串（'2026年10月10日'，旧）或日期列 Excel 序列号（46305=2026-10-10，新），
-    以后出现者为准。
+def _human_items(ws, start: int, end: int, block_date: datetime.date) -> list:
+    """人工表块内数据行 -> [(名称, url, 起拍价wan, 评估价wan, 开始时间, 围观人数, 开始日期)]
 
     行版式逐行判定（京东三种历史版式全兼容）：
     E 列时间特征 → 标准版式（C=起拍/D=评估/E=开始时间/F=围观）；
     否则 D 列为价格且 F 列为围观 → 过渡版式（D=起拍/E=评估，开始时间记空）。
     """
-    last_date_row = None
-    last_date = None
-    for r in range(1, ws.max_row + 1):
-        v = ws.cell(row=r, column=date_col).value
-        if _is_date_cell(v):
-            last_date_row = r
-            last_date = _date_str(v)
-
-    if last_date_row is None:
-        return None, []
-
-    # 提取日期（数据块标题行）→ 用于无年份拍卖开始时间补全年份 / 跨年判断
-    extract_date = parse_start_time(last_date)
-    default_year = extract_date.year if extract_date else None
-
+    default_year, after = block_date.year, block_date
     items = []
-    for r in range(last_date_row + 1, ws.max_row + 1):
+    for r in range(start + 1, end):
         name = ws.cell(row=r, column=1).value
         url = ws.cell(row=r, column=2).value
         if not name:
@@ -949,7 +998,7 @@ def _parse_block(ws, date_col: int, sheet_name: str = ''):
             # 标准版式：C=起拍/D=评估/E=开始时间
             start_price, eval_price = sp3, ep4
             start_time = st_raw
-            start_date = parse_start_time(st_raw, default_year=default_year, after=extract_date)
+            start_date = parse_start_time(st_raw, default_year=default_year, after=after)
         elif sp3 is None and ep4 is not None:
             # 过渡版式：C=城市面积/D=起拍/E=评估，开始时间记空
             start_price, eval_price = ep4, parse_price_to_wan(c5)
@@ -966,7 +1015,112 @@ def _parse_block(ws, date_col: int, sheet_name: str = ''):
             continue
         items.append((str(name).strip(), str(url).strip() if url else '',
                       start_price, eval_price, start_time, views_i, start_date))
-    return last_date, items
+    return items
+
+
+def _api_items(ws, start: int, end: int, block_date: datetime.date) -> list:
+    """「京东API」块内数据行 -> 与人工块同构的 items（16 列映射见顶部常量）"""
+    default_year, after = block_date.year, block_date
+    items = []
+    for r in range(start + 1, end):
+        name = ws.cell(row=r, column=API_NAME).value
+        if not name:
+            continue
+        sp = parse_price_to_wan(ws.cell(row=r, column=API_START_P).value)
+        ep = parse_price_to_wan(ws.cell(row=r, column=API_EVAL_P).value)
+        sp = sp if sp is not None and sp > 0 else None      # 0 = 缺失，不能当 0 万展示
+        ep = ep if ep is not None and ep > 0 else None
+        if sp is None and ep is None:
+            continue
+        st_raw = str(ws.cell(row=r, column=API_START_T).value or '').strip()
+        views_v = ws.cell(row=r, column=API_VIEWS).value
+        views_i = int(views_v) if isinstance(views_v, (int, float)) and \
+            not isinstance(views_v, bool) else None
+        url = str(ws.cell(row=r, column=API_URL).value or '').strip()
+        items.append((str(name).strip(), url, sp, ep, st_raw, views_i,
+                      parse_start_time(st_raw, default_year=default_year, after=after)))
+    return items
+
+
+def _tuple_key(it):
+    """并集去重键：(清洗名去二拍/变卖前缀, 起拍价)"""
+    return (MARK_PREFIX_RE.sub('', _display_name(it[0])), it[2])
+
+
+def _same_property(a, b) -> bool:
+    if a[0] != b[0]:
+        return False
+    if a[1] is None or b[1] is None:
+        return True
+    return abs(a[1] - b[1]) <= API_MERGE_TOL
+
+
+def _merge_sources(human: list, api: list) -> list:
+    """人工块 ∪ API 块：围观/价格取 API，名称保「二拍/变卖」标记（保住置顶行序）"""
+    out = list(human)
+    for a in api:
+        ka = _tuple_key(a)
+        hit = next((i for i, h in enumerate(out) if _same_property(ka, _tuple_key(h))), None)
+        if hit is None:
+            out.append(a)
+            continue
+        h = out[hit]
+        marked_api = bool(MARK_PREFIX_RE.search(ka[0]))
+        name = a[0] if marked_api and not MARK_PREFIX_RE.search(_tuple_key(h)[0]) else h[0]
+        out[hit] = (
+            name,
+            a[1] or h[1],
+            a[2] if a[2] is not None else h[2],
+            a[3] if a[3] is not None else h[3],
+            a[4] if _looks_like_time(a[4]) else h[4],
+            a[5] if a[5] is not None else h[5],
+            a[6] if a[6] is not None else h[6],
+        )
+    return out
+
+
+def _parse_block(ws, date_col: int, sheet_name: str = '', target=None):
+    """返回 (提取日期字符串, 数据行列表, matched)。
+
+    取 target（业务日）当日块；同日无块才回退到最新非空块（matched=False）。
+    target=None 时退化为旧行为（取最新非空块）。
+    """
+    markers = _date_markers(ws, date_col)
+    if not markers:
+        return None, [], False
+    fallback = None
+    for start, end, d in reversed(list(_iter_blocks(ws, markers))):
+        items = _human_items(ws, start, end, d)
+        if not items:
+            continue
+        block_date = d.strftime('%Y年%m月%d日')
+        if target is None or d == target:
+            return block_date, items, True
+        if fallback is None:
+            fallback = (block_date, items)
+    if fallback:
+        return fallback[0], fallback[1], False
+    return markers[-1][1].strftime('%Y年%m月%d日'), [], False
+
+
+def _parse_api_block(ws, target=None):
+    """「京东API」块 -> (提取日期字符串, items, matched)，语义同 _parse_block"""
+    markers = _date_markers(ws, 1)
+    if not markers:
+        return None, [], False
+    fallback = None
+    for start, end, d in reversed(list(_iter_blocks(ws, markers))):
+        items = _api_items(ws, start, end, d)
+        if not items:
+            continue
+        block_date = d.strftime('%Y年%m月%d日')
+        if target is None or d == target:
+            return block_date, items, True
+        if fallback is None:
+            fallback = (block_date, items)
+    if fallback:
+        return fallback[0], fallback[1], False
+    return markers[-1][1].strftime('%Y年%m月%d日'), [], False
 
 
 def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
@@ -990,12 +1144,34 @@ def render_section(xlsx_path: str, top: int, fetch_area: bool = True,
 
     lines = ['## 今日法拍资产热点', '']
     any_data = False
-    for sheet_name, date_col in SHEETS:
+    for sheet_name, date_col, api_src in SHEETS:
         if sheet_name not in wb.sheetnames:
             lines.append(f'### {sheet_name}法拍\n\n数据源缺少 sheet「{sheet_name}」。\n')
             continue
         ws = wb[sheet_name]
-        _extract_date, items = _parse_block(ws, date_col, sheet_name)
+        block_date, items, matched = _parse_block(ws, date_col, sheet_name, target=today)
+
+        api_date, api_matched = None, False
+        if api_src:
+            if api_src in wb.sheetnames:
+                api_date, api_items, api_matched = _parse_api_block(wb[api_src], target=today)
+                if api_matched:
+                    items = _merge_sources([] if not matched else items, api_items)
+                else:
+                    print(f'[paipai] 提示：并集源「{api_src}」当日无块（{api_date}），'
+                          f'仅人工块出表', file=sys.stderr)
+            else:
+                print(f'[paipai] 提示：并集源「{api_src}」不存在，仅人工块出表',
+                      file=sys.stderr)
+
+        # 回退必须可见（2026-11-14）：标题写当日、数据却是旧块时读者无从察觉
+        if not (matched or api_matched):
+            eff = max([d for d in (block_date, api_date) if d] or [block_date or '—'])
+            lines.append(f'> ⚠️ 数据日期：{eff}（{today.isoformat()} 当日无有效块，已回退）')
+            lines.append('')
+            print(f'[paipai] [回退] {sheet_name} 当日无有效块，回退至 {eff}',
+                  file=sys.stderr)
+
         if not items:
             lines.append(f'### {sheet_name}法拍\n\n今日无提取数据。\n')
             continue
